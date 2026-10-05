@@ -49,6 +49,9 @@ func Run(cfgPath string, o Options) error {
 		fmt.Printf("监听地址已设置为 %s\n", o.Listen)
 	}
 	if o.BasePath != nil {
+		if !config.ValidBasePath(*o.BasePath) {
+			return fmt.Errorf("访问路径只能由字母、数字和 . _ - ~ 组成，用 / 分段（如 /panel）")
+		}
 		v := config.NormalizeBasePath(*o.BasePath)
 		if err := setYAML(cfgPath, "", "base_path", fmt.Sprintf("%q", v)); err != nil {
 			return err

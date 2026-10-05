@@ -22,6 +22,7 @@ import (
 	"gost-webui/internal/config"
 	"gost-webui/internal/controller"
 	"gost-webui/internal/store"
+	"gost-webui/internal/system"
 )
 
 // Server 面板 HTTP 服务。
@@ -48,6 +49,10 @@ type Server struct {
 	subSrv   *http.Server
 	subCtx   context.Context
 	certProv *cert.Provider
+	// subErr 最近一次订阅监听器启动失败的原因（nil 表示监听正常）。
+	subErr error
+	// timeGuard 时间同步守护（可为 nil）
+	timeGuard *system.TimeGuard
 }
 
 // New 创建服务。
@@ -64,6 +69,8 @@ func New(cfg *config.Config, ctl *controller.Controller, web fs.FS, log *slog.Lo
 		failures: map[string]*loginFailure{},
 	}
 	s.routes()
+	// 订阅监听端口也要随节点端口一起放行
+	ctl.ExtraPorts = func() []int { return []int{s.readSubSettings().Port} }
 	return s
 }
 
@@ -107,8 +114,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/system", s.auth(s.handleSystemInfo))
 	s.mux.HandleFunc("GET /api/reality/available", s.auth(s.handleRealityAvailable))
 	s.mux.HandleFunc("POST /api/reality/credential", s.auth(s.handleRealityCredential))
+	s.mux.HandleFunc("GET /api/reality/sni", s.auth(s.handleRealitySNI))
 	s.mux.HandleFunc("PUT /api/system", s.auth(s.handleSystemUpdate))
 	s.mux.HandleFunc("POST /api/system/restart", s.auth(s.handleSystemRestart))
+	s.mux.HandleFunc("GET /api/system/time", s.auth(s.handleSystemTime))
+	s.mux.HandleFunc("POST /api/system/time-sync", s.auth(s.handleSystemTimeSync))
 
 	s.mux.HandleFunc("GET /api/notify", s.auth(s.handleNotifyGet))
 	s.mux.HandleFunc("PUT /api/notify", s.auth(s.handleNotifyPut))
@@ -148,6 +158,15 @@ func (s *Server) Handler() http.Handler {
 		http.Redirect(w, r, s.basePath+"/", http.StatusFound)
 	})
 	return outer
+}
+
+// sysCtx 返回与 HTTP 请求生命周期解耦、但有兜底超时的上下文，用于防火墙 / timedatectl / 引擎配置下发
+// 这类系统侧副作用：浏览器中途断开不能把 ufw、firewall-cmd --reload 之类的命令杀在半路。
+func sysCtx(r *http.Request) context.Context {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
+	// 2 分钟后由定时器释放；调用方不需要显式 cancel
+	_ = cancel
+	return ctx
 }
 
 // ---------- 通用工具 ----------
@@ -257,6 +276,20 @@ func (st *sessionStore) remove(token string) {
 	}
 }
 
+// removeAllExcept 使除 keep 以外的全部会话失效（改密码后调用：当前浏览器保持登录，其它地方一律重新登录）。
+func (st *sessionStore) removeAllExcept(keep string) {
+	st.mu.Lock()
+	for k := range st.m {
+		if k != keep {
+			delete(st.m, k)
+		}
+	}
+	st.mu.Unlock()
+	if st.db != nil {
+		_ = st.db.DeleteSessionsExcept(keep)
+	}
+}
+
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(cookieName)
@@ -313,9 +346,56 @@ func (s *Server) checkPassword(pass string) bool {
 	return false
 }
 
+// loginFailure 记录某个来源（或全局）的登录失败计数。
 type loginFailure struct {
-	count int
-	until time.Time
+	count  int       // 当前计数窗口内的失败次数
+	window time.Time // 计数窗口截止时间（首次失败后 1 分钟）
+	until  time.Time // 锁定截止时间
+}
+
+// 登录失败限制：单来源 5 次/分钟锁 1 分钟；所有来源合计 30 次/分钟全局锁 1 分钟
+// （防止反代场景下换 IP / 伪造头绕过）。
+const (
+	loginFailPerIP  = 5
+	loginFailGlobal = 30
+	loginLockFor    = time.Minute
+	loginGlobalKey  = "*"
+)
+
+// loginLocked 判断该来源或全局是否处于锁定期（需持有 s.mu）。
+func (s *Server) loginLocked(ip string, now time.Time) bool {
+	for _, k := range [...]string{ip, loginGlobalKey} {
+		if f := s.failures[k]; f != nil && now.Before(f.until) {
+			return true
+		}
+	}
+	return false
+}
+
+// recordLoginFailure 记一次失败，窗口内达到阈值则锁定；顺手清理过期条目，避免 map 无限增长（需持有 s.mu）。
+func (s *Server) recordLoginFailure(ip string, now time.Time) {
+	bump := func(key string, limit int) {
+		f := s.failures[key]
+		if f == nil || now.After(f.window) {
+			f = &loginFailure{window: now.Add(loginLockFor)}
+			s.failures[key] = f
+		}
+		f.count++
+		if f.count >= limit {
+			f.until = now.Add(loginLockFor)
+			f.window = f.until
+			f.count = 0
+		}
+	}
+	bump(ip, loginFailPerIP)
+	bump(loginGlobalKey, loginFailGlobal)
+	if len(s.failures) > 512 {
+		for k, f := range s.failures {
+			if k != loginGlobalKey && now.After(f.window) && now.After(f.until) {
+				delete(s.failures, k)
+			}
+		}
+	}
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -327,9 +407,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	ip := clientIP(r)
+	// 限流键只用真实对端地址：X-Forwarded-For 可被客户端任意伪造，用它做键等于没有限制。
+	ip := remoteHost(r)
+	now := time.Now()
 	s.mu.Lock()
-	if f := s.failures[ip]; f != nil && time.Now().Before(f.until) {
+	if s.loginLocked(ip, now) {
 		s.mu.Unlock()
 		writeErr(w, http.StatusTooManyRequests, "尝试过于频繁，请稍后再试")
 		return
@@ -338,16 +420,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	if strings.TrimSpace(req.Username) != s.adminUser() || !s.checkPassword(req.Password) {
 		s.mu.Lock()
-		f := s.failures[ip]
-		if f == nil {
-			f = &loginFailure{}
-			s.failures[ip] = f
-		}
-		f.count++
-		if f.count >= 5 {
-			f.until = time.Now().Add(time.Minute)
-			f.count = 0
-		}
+		s.recordLoginFailure(ip, time.Now())
 		s.mu.Unlock()
 		writeErr(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
@@ -399,13 +472,8 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func clientIP(r *http.Request) string {
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		if i := strings.IndexByte(v, ','); i > 0 {
-			return strings.TrimSpace(v[:i])
-		}
-		return strings.TrimSpace(v)
-	}
+// remoteHost 返回 TCP 对端地址（不看任何转发头）。
+func remoteHost(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

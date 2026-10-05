@@ -23,17 +23,33 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"gost-webui/internal/model"
 )
 
 // ---------- 凭据 ----------
 
-// RealityCred 是 reality 节点的凭据（存于 model.Node）。
+// RealityCred 是 sing-box 节点的凭据与传输方式（存于 model.Node）。
+// Transport 为空/"reality" 时用 REALITY（ServerName/PrivateKey/PublicKey/ShortID 生效）；
+// "ws-tls" / "ws" 为加速兼容模式：VLESS over WebSocket（WSPath），源站自签 TLS 或明文。
 type RealityCred struct {
 	UUID       string `json:"uuid"`
 	PrivateKey string `json:"privKey"`
 	PublicKey  string `json:"pubKey"`
 	ShortID    string `json:"shortId"`
 	ServerName string `json:"serverName"`
+	Transport  string `json:"transport,omitempty"`
+	WSPath     string `json:"wsPath,omitempty"`
+}
+
+// IsWS 判断是否为 WebSocket 加速兼容模式。
+func (c *RealityCred) IsWS() bool { return c.Transport == "ws" || c.Transport == "ws-tls" }
+
+// GenerateWSPath 生成随机 WebSocket 路径（/ + 12 位 hex）。
+func GenerateWSPath() string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return "/" + hex.EncodeToString(b)
 }
 
 func GenerateRealityKeypair() (priv, pub string, err error) {
@@ -68,11 +84,75 @@ func ValidServerName(s string) bool {
 	return true
 }
 
-// ClientURL 生成 vless:// 分享链接（host 为面板公网地址）。
+// ClientURL 生成客户端直连本机的分享链接（host 为面板公网地址）。
+// REALITY：vless+reality；VMess+TCP：vmess://（v2rayN JSON）；WS+TLS：源站自签证书，带 allowInsecure=1；WS 明文：security=none。
 func ClientURL(c *RealityCred, port int, host, name string) string {
+	switch c.Transport {
+	case "vmess":
+		return vmessURL(c.UUID, host, port, name)
+	case "ws-tls":
+		return fmt.Sprintf(
+			"vless://%s@%s:%d?encryption=none&security=tls&sni=%s&allowInsecure=1&type=ws&host=%s&path=%s#%s",
+			c.UUID, host, port, host, host, urlEscape(c.WSPath), urlEscape(name))
+	case "ws":
+		return fmt.Sprintf(
+			"vless://%s@%s:%d?encryption=none&security=none&type=ws&host=%s&path=%s#%s",
+			c.UUID, host, port, host, urlEscape(c.WSPath), urlEscape(name))
+	}
 	return fmt.Sprintf(
 		"vless://%s@%s:%d?encryption=none&security=reality&type=tcp&sni=%s&fp=chrome&pbk=%s&sid=%s&flow=xtls-rprx-vision#%s",
 		c.UUID, host, port, c.ServerName, c.PublicKey, c.ShortID, urlEscape(name))
+}
+
+// vmessURL 生成 v2rayN 约定的 vmess:// 链接（base64 JSON，v2rayN / v2rayNG / 小火箭 / Clash 均可导入）：
+// VMess + TCP、无 TLS、alterId 0、加密 auto。
+func vmessURL(uuid, host string, port int, name string) string {
+	obj := map[string]any{
+		"v": "2", "ps": name, "add": host, "port": strconv.Itoa(port), "id": uuid,
+		"aid": "0", "scy": "auto", "net": "tcp", "type": "none", "host": "", "path": "", "tls": "",
+	}
+	b, _ := json.Marshal(obj)
+	return "vmess://" + base64.StdEncoding.EncodeToString(b)
+}
+
+// AccelClientURL 生成"经加速入口"的客户端链接。accel 为入口 host:port。
+// WS 模式：加速入口（CDN/HTTP 加速）对客户端提供正式 TLS，SNI/Host 用入口域名；
+// REALITY：纯 TCP 中转，只换地址端口。
+func AccelClientURL(c *RealityCred, accel, name string) string {
+	host, portStr, err := net.SplitHostPort(accel)
+	if err != nil {
+		return ""
+	}
+	port, _ := strconv.Atoi(portStr)
+	if c.Transport == "vmess" {
+		return vmessURL(c.UUID, host, port, name)
+	}
+	if c.IsWS() {
+		return fmt.Sprintf(
+			"vless://%s@%s:%d?encryption=none&security=tls&sni=%s&type=ws&host=%s&path=%s#%s",
+			c.UUID, host, port, host, host, urlEscape(c.WSPath), urlEscape(name))
+	}
+	return ClientURL(c, port, host, name)
+}
+
+// CredOf 从节点取出 sing-box 凭据与传输方式。
+func CredOf(n *model.Node) *RealityCred {
+	return &RealityCred{
+		UUID: n.RealityUUID, PrivateKey: n.RealityPriv, PublicKey: n.RealityPub,
+		ShortID: n.RealityShortID, ServerName: n.RealitySNI,
+		Transport: n.SBTransport(), WSPath: n.RealityWSPath,
+	}
+}
+
+// NodeClientURL 生成节点的客户端链接：填了加速入口就指向入口，否则直连面板主机。
+func NodeClientURL(n *model.Node, host string) string {
+	c := CredOf(n)
+	if n.AccelHost != "" {
+		if u := AccelClientURL(c, n.AccelHost, n.Name); u != "" {
+			return u
+		}
+	}
+	return ClientURL(c, n.ListenPort, host, n.Name)
 }
 
 func urlEscape(s string) string {
@@ -104,25 +184,45 @@ type instanceConfig struct {
 	Experimental struct {
 		ClashAPI struct {
 			ExternalController string `json:"external_controller"`
+			Secret             string `json:"secret,omitempty"`
 		} `json:"clash_api"`
 	} `json:"experimental"`
 }
 
-// buildInstanceConfig 生成单节点 config.json。
-func buildInstanceConfig(id string, port int, c *RealityCred, apiAddr string) ([]byte, error) {
+// buildInstanceConfig 生成单节点 config.json；up 非空时出站经落地机的 SOCKS5 / HTTP 代理；
+// certFile/keyFile 仅 ws-tls 模式使用。apiSecret 保护 clash API：本机其它用户/进程不能读连接明细或改配置。
+func buildInstanceConfig(id string, port int, c *RealityCred, apiAddr, apiSecret string, up *model.Upstream, certFile, keyFile string) ([]byte, error) {
 	ic := instanceConfig{}
 	ic.Log.Level = "warning"
 	ic.Log.Timestamp = true
 	ic.Route.Final = "out"
 	ic.Experimental.ClashAPI.ExternalController = apiAddr
+	ic.Experimental.ClashAPI.Secret = apiSecret
 
 	inbound := map[string]any{
 		"type":        "vless",
 		"tag":         id,
 		"listen":      "::",
 		"listen_port": port,
-		"users":       []map[string]any{{"uuid": c.UUID, "flow": "xtls-rprx-vision"}},
-		"tls": map[string]any{
+	}
+	switch c.Transport {
+	case "vmess":
+		// VMess + TCP、无 TLS：首包为 VMess 加密头，纯 TCP 转发类加速可直接透传
+		inbound["type"] = "vmess"
+		inbound["users"] = []map[string]any{{"uuid": c.UUID, "alterId": 0}}
+	case "ws", "ws-tls":
+		// WebSocket 不能用 vision flow（flow 要求端到端 TLS 直通）
+		inbound["users"] = []map[string]any{{"uuid": c.UUID}}
+		inbound["transport"] = map[string]any{
+			"type": "ws", "path": c.WSPath,
+			"early_data_header_name": "Sec-WebSocket-Protocol", "max_early_data": 2048,
+		}
+		if c.Transport == "ws-tls" {
+			inbound["tls"] = map[string]any{"enabled": true, "certificate_path": certFile, "key_path": keyFile}
+		}
+	default:
+		inbound["users"] = []map[string]any{{"uuid": c.UUID, "flow": "xtls-rprx-vision"}}
+		inbound["tls"] = map[string]any{
 			"enabled":     true,
 			"server_name": c.ServerName,
 			"reality": map[string]any{
@@ -131,19 +231,42 @@ func buildInstanceConfig(id string, port int, c *RealityCred, apiAddr string) ([
 				"private_key": c.PrivateKey,
 				"short_id":    []string{c.ShortID},
 			},
-		},
+		}
 	}
 	ib, err := json.Marshal(inbound)
 	if err != nil {
 		return nil, err
 	}
-	ob, err := json.Marshal(map[string]any{"type": "direct", "tag": "out"})
+	ob, err := json.Marshal(outboundFor(up))
 	if err != nil {
 		return nil, err
 	}
 	ic.Inbounds = []json.RawMessage{ib}
 	ic.Outbounds = []json.RawMessage{ob}
 	return json.MarshalIndent(&ic, "", "  ")
+}
+
+// outboundFor 生成出站：无出口代理时直出；有则 socks / http 出站（https 为 http + TLS）。
+func outboundFor(up *model.Upstream) map[string]any {
+	if up == nil || up.Host == "" || up.Port <= 0 {
+		return map[string]any{"type": "direct", "tag": "out"}
+	}
+	ob := map[string]any{"tag": "out", "server": up.Host, "server_port": up.Port}
+	switch up.Type {
+	case "http", "https":
+		ob["type"] = "http"
+		if up.Type == "https" {
+			ob["tls"] = map[string]any{"enabled": true, "server_name": up.Host}
+		}
+	default:
+		ob["type"] = "socks"
+		ob["version"] = "5"
+	}
+	if up.User != "" {
+		ob["username"] = up.User
+		ob["password"] = up.Pass
+	}
+	return ob
 }
 
 // ---------- 实例池 ----------
@@ -160,13 +283,14 @@ type Stats struct {
 }
 
 type instance struct {
-	id       string
-	dir      string
-	confFile string
-	logFile  string
-	apiAddr  string
-	bin      string
-	log      *slog.Logger
+	id        string
+	dir       string
+	confFile  string
+	logFile   string
+	apiAddr   string
+	apiSecret string
+	bin       string
+	log       *slog.Logger
 
 	mu      sync.Mutex
 	cmd     *exec.Cmd
@@ -201,36 +325,64 @@ func Installed(bin string) bool {
 	return err == nil && strings.Contains(string(out), "sing-box")
 }
 
-func apiPortFor(id string) int {
-	// 由节点 ID 散列到 19100-19899 的本地回环端口，稳定且不与常规端口冲突。
+// apiPortFor 由节点 ID 散列到 19100-19899 的本地回环端口；与任一节点监听端口相同、
+// 或已被占用（其它服务）时顺延到下一个空闲端口——否则 clash API 绑不上，sing-box 起不来。
+// 实例一旦创建就沿用其端口（见 Apply），避免每次应用配置都换端口触发重启。
+func apiPortFor(id string, avoid map[int]bool) int {
 	var h uint32
 	for _, ch := range id {
 		h = h*131 + uint32(ch)
 	}
-	return 19100 + int(h%800)
+	base := 19100 + int(h%800)
+	for i := 0; i < 800; i++ {
+		p := 19100 + (base-19100+i)%800
+		if avoid[p] {
+			continue
+		}
+		if l, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p)); err == nil {
+			_ = l.Close()
+			return p
+		}
+	}
+	return base
 }
 
 func (p *Pool) nodeDir(id string) string { return filepath.Join(p.dataDir, id) }
 
 // Apply 写入/更新节点配置并确保进程按期望状态运行（enabled 决定是否拉起）。
-func (p *Pool) Apply(ctx context.Context, id string, port int, cred *RealityCred, enabled bool) error {
+// avoidPorts 是面板所有节点的监听端口（gost 可能尚未绑定，不能只靠探测），clash API 端口须避开。
+func (p *Pool) Apply(ctx context.Context, id string, port int, cred *RealityCred, up *model.Upstream, avoidPorts []int, enabled bool) error {
 	dir := p.nodeDir(id)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	apiAddr := "127.0.0.1:" + strconv.Itoa(apiPortFor(id))
-	cfgBytes, err := buildInstanceConfig(id, port, cred, apiAddr)
-	if err != nil {
-		return err
-	}
 	confFile := filepath.Join(dir, "config.json")
-
 	p.mu.Lock()
 	inst := p.inst[id]
 	if inst == nil {
-		inst = &instance{id: id, dir: dir, confFile: confFile, logFile: filepath.Join(dir, "sb.log"), apiAddr: apiAddr, bin: p.bin, log: p.log}
+		avoid := map[int]bool{port: true}
+		for _, ap := range avoidPorts {
+			avoid[ap] = true
+		}
+		apiAddr := "127.0.0.1:" + strconv.Itoa(apiPortFor(id, avoid))
+		inst = &instance{id: id, dir: dir, confFile: confFile, logFile: filepath.Join(dir, "sb.log"), apiAddr: apiAddr, apiSecret: GenerateUUID(), bin: p.bin, log: p.log}
 		p.inst[id] = inst
 	}
+	apiAddr, apiSecret := inst.apiAddr, inst.apiSecret
+	p.mu.Unlock()
+	certFile, keyFile := "", ""
+	if cred.Transport == "ws-tls" {
+		var cerr error
+		if certFile, keyFile, cerr = EnsureSelfSignedCert(dir, ""); cerr != nil {
+			return fmt.Errorf("生成自签证书失败: %w", cerr)
+		}
+	}
+	cfgBytes, err := buildInstanceConfig(id, port, cred, apiAddr, apiSecret, up, certFile, keyFile)
+	if err != nil {
+		return err
+	}
+
+	p.mu.Lock()
 	changed := false
 	if old, err := os.ReadFile(confFile); err != nil || string(old) != string(cfgBytes) {
 		tmp := confFile + ".tmp"
@@ -526,7 +678,7 @@ func (i *instance) stats(ctx context.Context) Stats {
 	if procRunning {
 		pid = i.cmd.Process.Pid
 	}
-	api := i.apiAddr
+	api, secret := i.apiAddr, i.apiSecret
 	lastErr := i.lastErr
 	i.mu.Unlock()
 
@@ -540,6 +692,7 @@ func (i *instance) stats(ctx context.Context) Stats {
 	if err != nil {
 		return st
 	}
+	req.Header.Set("Authorization", "Bearer "+secret)
 	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
 	if err != nil {
 		return st

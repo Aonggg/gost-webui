@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"os/exec"
 	"strconv"
@@ -98,21 +100,34 @@ func (s *Server) handleSystemUpdate(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "面板端口不正确，请输入 1-65535")
 			return
 		}
+		if _, port, err := net.SplitHostPort(v); err == nil {
+			if p, err := strconv.Atoi(port); err == nil && p == s.readSubSettings().Port {
+				writeErr(w, http.StatusBadRequest, fmt.Sprintf("面板端口不能与订阅端口 %d 相同", p))
+				return
+			}
+		}
 		if err := s.ctl.Store.SetSetting("panel_listen", v); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		changed = changed || v != oldListen
+		if v != oldListen {
+			// 新面板端口先放行，重启后才不会被防火墙挡在外面
+			if _, port, err := net.SplitHostPort(v); err == nil {
+				if p, err := strconv.Atoi(port); err == nil && s.ctl.FirewallAuto() {
+					if kind, _, err := system.OpenPort(sysCtx(r), p, "tcp"); err != nil {
+						s.log.Warn("放行新面板端口失败", "port", p, "firewall", kind, "err", err)
+					}
+				}
+			}
+		}
 	}
 	if req.BasePath != nil {
-		v := config.NormalizeBasePath(*req.BasePath)
-		if v != "" && !strings.HasPrefix(v, "/") {
-			v = "/" + v
-		}
-		if strings.ContainsAny(v, " \t?#") {
-			writeErr(w, http.StatusBadRequest, "访问路径不能包含空格或 ? # 等字符")
+		if !config.ValidBasePath(*req.BasePath) {
+			writeErr(w, http.StatusBadRequest, "访问路径只能由字母、数字和 . _ - ~ 组成，用 / 分段（如 /panel）")
 			return
 		}
+		v := config.NormalizeBasePath(*req.BasePath)
 		if err := s.ctl.Store.SetSetting("base_path", v); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -163,6 +178,76 @@ func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(600 * time.Millisecond)
 		fn()
 	}()
+}
+
+// SetTimeGuard 注入时间同步守护（可为 nil）。
+func (s *Server) SetTimeGuard(g *system.TimeGuard) { s.timeGuard = g }
+
+// timeState 返回时钟综合状态（无守护时按主机指标兜底）。
+func (s *Server) timeState() string {
+	if s.timeGuard != nil {
+		return s.timeGuard.State()
+	}
+	if s.ctl.Alerts != nil {
+		if met, _ := s.ctl.Alerts.Metrics(); met.ClockSynced != nil {
+			if *met.ClockSynced {
+				return "synced"
+			}
+			return "unsynced"
+		}
+	}
+	return "unknown"
+}
+
+// timeAutofix 读取"自动校时"设置（默认开启）。
+func (s *Server) timeAutofix() bool {
+	if v, ok := s.ctl.Store.GetSetting("time_autofix"); ok {
+		return v != "false"
+	}
+	return true
+}
+
+// handleSystemTime 返回时间同步状态与相关设置。
+func (s *Server) handleSystemTime(w http.ResponseWriter, r *http.Request) {
+	var st system.TimeStatus
+	if s.timeGuard != nil {
+		// 用守护每分钟刷新的缓存：这个接口被系统页每 5 秒轮询一次，不能每次都去跑 systemctl / timedatectl
+		st = s.timeGuard.Status()
+		st.Now = time.Now().Unix()
+	} else {
+		st = system.ReadTimeStatus()
+		st.State = s.timeState()
+	}
+	tz, _ := s.ctl.Store.GetSetting("server_timezone")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":         st,
+		"autofix":        s.timeAutofix(),
+		"serverTimezone": tz,
+	})
+}
+
+// handleSystemTimeSync 立即执行一次校时：启用/安装 NTP → 等待校准 → HTTP 兜底。
+func (s *Server) handleSystemTimeSync(w http.ResponseWriter, r *http.Request) {
+	if s.timeGuard == nil {
+		writeErr(w, http.StatusServiceUnavailable, "时间同步守护未启用")
+		return
+	}
+	// 不绑定请求 ctx：浏览器中途断开也要把校时做完
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	detail, err := s.timeGuard.FixNow(ctx)
+	if s.ctl.Alerts != nil {
+		s.ctl.Alerts.RefreshMetrics()
+	}
+	if err != nil {
+		code := http.StatusInternalServerError
+		if err == system.ErrTimeFixBusy {
+			code = http.StatusConflict
+		}
+		writeErr(w, code, err.Error()+"\n"+detail)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "detail": detail, "status": s.timeGuard.Status()})
 }
 
 // ---------- 通知（Telegram） ----------

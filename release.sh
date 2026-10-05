@@ -57,7 +57,7 @@ $(ls -1 "$OUT" 2>/dev/null | sed 's/^/  /')
 发布步骤：
   1) 提交源码到 GitHub（含 install.sh，用户即可一键安装）
        git init 2>/dev/null; git add -A && git commit -m "release v${VERSION}"
-       git remote add origin https://github.com/baiduxc/${PKG}.git
+       git remote add origin https://github.com/Aonggg/${PKG}.git
        git push -u origin main
 
   2) （可选，推荐）上传预编译二进制到 Release，安装更快且无需在服务器上编译
@@ -65,11 +65,11 @@ $(ls -1 "$OUT" 2>/dev/null | sed 's/^/  /')
           --title "v${VERSION}" --notes "GOST 面板 v${VERSION}"
 
   3) 新服务器一键安装（源码构建，脚本会自动装 Go）
-       curl -fsSL https://raw.githubusercontent.com/baiduxc/${PKG}/main/install.sh | sudo bash
+       curl -fsSL https://raw.githubusercontent.com/Aonggg/${PKG}/main/install.sh | sudo bash
 
   4) 新服务器一键安装（使用 Release 预编译包，最快）
-       curl -fsSL https://raw.githubusercontent.com/baiduxc/${PKG}/main/install.sh \\
-         | sudo PANEL_RELEASE_URL="https://github.com/baiduxc/${PKG}/releases/download/v${VERSION}/${PKG}_${VERSION}_linux_{arch}.tar.gz" bash
+       curl -fsSL https://raw.githubusercontent.com/Aonggg/${PKG}/main/install.sh \\
+         | sudo PANEL_RELEASE_URL="https://github.com/Aonggg/${PKG}/releases/download/v${VERSION}/${PKG}_${VERSION}_linux_{arch}.tar.gz" bash
 
   提示：{arch} 会按机器架构自动替换。
 ==================================================

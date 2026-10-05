@@ -13,6 +13,8 @@ RestartSec=3
 LimitNOFILE=1048576
 KillMode=control-group
 TimeoutStopSec=15
+# 面板/gost/sing-box 统一按北京时间：每日配额在北京时间 0 点重置，日志与通知时间可读
+Environment=TZ=Asia/Shanghai
 
 [Install]
 WantedBy=multi-user.target

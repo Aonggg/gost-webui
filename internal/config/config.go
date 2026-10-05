@@ -105,8 +105,23 @@ func Default() *Config {
 	}
 }
 
-// NormalizeBasePath 规范化访问路径前缀。
+// NormalizeBasePath 规范化访问路径前缀：补前导斜杠、去尾部斜杠，根路径返回空串。
+// 含非法字符（见 ValidPathPrefix）的值一律回落为根路径——这些值会让 ServeMux 注册时 panic，
+// 面板起不来比"路径没生效"严重得多。要提示用户请先用 ValidBasePath 校验。
 func NormalizeBasePath(p string) string {
+	p = normalizePathPrefix(p)
+	if !ValidPathPrefix(p) {
+		return ""
+	}
+	return p
+}
+
+// ValidBasePath 判断用户输入的访问路径规范化后是否合法（空/根路径视为合法）。
+func ValidBasePath(p string) bool {
+	return ValidPathPrefix(normalizePathPrefix(p))
+}
+
+func normalizePathPrefix(p string) string {
 	p = strings.TrimSpace(p)
 	if p == "" || p == "/" {
 		return ""
@@ -115,6 +130,32 @@ func NormalizeBasePath(p string) string {
 		p = "/" + p
 	}
 	return strings.TrimRight(p, "/")
+}
+
+// ValidPathPrefix 判断已规范化的路径前缀是否只含安全字符：每段非空且只含
+// 字母、数字、`. _ ~ -`，不含 `{ }`（ServeMux 通配符）、空白、`? #`、`.`/`..` 段等。
+// 空串（根路径）合法。
+func ValidPathPrefix(p string) bool {
+	if p == "" {
+		return true
+	}
+	if !strings.HasPrefix(p, "/") || strings.HasSuffix(p, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(p[1:], "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+		for _, c := range seg {
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			case c == '.', c == '_', c == '~', c == '-':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Load 从 path 加载配置；文件不存在时写入默认配置。
@@ -176,6 +217,11 @@ func applyDefaults(c *Config) {
 	}
 	if c.Gost.APIUser == "" {
 		c.Gost.APIUser = d.Gost.APIUser
+	}
+	if c.Gost.APIPass == "" {
+		// 手工编辑的配置漏掉 api_password 时不能让 gost API 裸奔：每次启动生成随机口令，
+		// 面板与它拉起的 gost 共用同一内存值即可，无需写回文件。
+		c.Gost.APIPass = RandomHex(16)
 	}
 	if c.Gost.LogFile == "" {
 		c.Gost.LogFile = d.Gost.LogFile

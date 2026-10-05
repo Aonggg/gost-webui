@@ -29,7 +29,7 @@ func BuildLandingSS(id, cipher, password string, port int, udp bool) (yaml strin
 	yaml += "  listener:\n"
 	yaml += "    type: tcp\n"
 
-	runCmd = fmt.Sprintf("gost -L \"ss://%s:%s@:%d\"", cipher, password, port)
+	runCmd = "gost -L " + shellQuote(fmt.Sprintf("ss://%s:%s@:%d", cipher, password, port))
 
 	if udp {
 		yaml += fmt.Sprintf("- name: ssu-%s\n", id)
@@ -42,7 +42,7 @@ func BuildLandingSS(id, cipher, password string, port int, udp bool) (yaml strin
 		yaml += "  listener:\n"
 		yaml += "    type: udp\n"
 
-		runCmd += fmt.Sprintf(" -L \"ssu://%s:%s@:%d\"", cipher, password, port)
+		runCmd += " -L " + shellQuote(fmt.Sprintf("ssu://%s:%s@:%d", cipher, password, port))
 	}
 	return yaml, runCmd
 }
@@ -81,7 +81,13 @@ func BuildLanding(n *model.Node) (yamlText string, runCmd string, err error) {
 		u.Fragment = ""
 		raw = u.String()
 	}
-	return sb.String(), fmt.Sprintf("gost -L %q", raw), nil
+	return sb.String(), "gost -L " + shellQuote(raw), nil
+}
+
+// shellQuote 把 s 包成 bash 单引号字符串：单引号内 $ ` \ 都不会被展开，
+// 字符串本身含有的单引号则先闭合、转义、再重开。密码里带 $ 或反引号时 %q（双引号）会被 shell 吃掉。
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // GostReleaseVersion 是落地机部署命令中固定使用的 GOST 发行版本。

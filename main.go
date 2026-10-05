@@ -28,9 +28,10 @@ import (
 	"gost-webui/internal/server"
 	"gost-webui/internal/singbox"
 	"gost-webui/internal/store"
+	"gost-webui/internal/system"
 )
 
-var version = "1.8.4"
+var version = "1.9.0"
 
 //go:embed all:web
 var embeddedWeb embed.FS
@@ -44,10 +45,56 @@ func main() {
 	setBasePath := flag.String("set-base-path", "", "设置访问路径：-set-base-path /panel（空串表示根路径）")
 	setPublicHost := flag.String("set-public-host", "", "设置服务器外网地址：-set-public-host 1.2.3.4")
 	showConf := flag.Bool("show", false, "打印当前配置摘要")
+	timeSync := flag.Bool("timesync", false, "校准系统时间：启用/安装 NTP，不可达时按 HTTP 校时（安装脚本与 go-ui 调用）")
+	timeZone := flag.String("timezone", "", "配合 -timesync：同时把系统时区设为指定值，如 Asia/Shanghai")
+	fwRelease := flag.Bool("fw-release", false, "收回面板自动放行过的全部防火墙端口（卸载脚本在停止服务后调用）")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("gost-webui", version)
+		return
+	}
+	if *timeSync {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		res, err := system.Fix(ctx, *timeZone, 30*time.Second)
+		for _, step := range res.Steps {
+			fmt.Println("  -", step)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			os.Exit(1)
+		}
+		st := system.ReadTimeStatus()
+		svc := st.NTPService
+		if svc == "" {
+			svc = "无"
+		}
+		fmt.Printf("  当前时间: %s  时区: %s  NTP 服务: %s\n",
+			time.Now().Format("2006-01-02 15:04:05 MST"), st.Timezone, svc)
+		return
+	}
+	if *fwRelease {
+		cfg, err := config.Load(*confPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			os.Exit(1)
+		}
+		dbPath := filepath.Join(cfg.DataDir, "panel.db")
+		if _, err := os.Stat(dbPath); err != nil {
+			return // 没有数据库就没有放行记录
+		}
+		st, err := store.Open(dbPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "错误: 打开数据库失败（面板是否仍在运行？）:", err)
+			os.Exit(1)
+		}
+		defer st.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		for _, spec := range controller.ReleaseManagedPorts(ctx, st) {
+			fmt.Println("  - 已收回防火墙端口", spec)
+		}
 		return
 	}
 
@@ -101,6 +148,12 @@ func main() {
 	}
 	if v, ok := st.GetSetting("base_path"); ok {
 		cfg.BasePath = config.NormalizeBasePath(v)
+	}
+	// 面板时区：以「系统设置 → 服务器时区」为准，覆盖 systemd 单元里固定的 TZ 环境变量
+	if v, ok := st.GetSetting("server_timezone"); ok && v != "" {
+		if err := system.ApplyProcessTimezone(v); err != nil {
+			logger.Warn("应用面板时区失败", "tz", v, "err", err)
+		}
 	}
 	sampleSeconds := cfg.SampleSeconds
 	retentionDays := cfg.RetentionDays
@@ -166,24 +219,34 @@ func main() {
 	alertMgr := alerts.New(st, notifier, logger)
 	ctl.Alerts = alertMgr
 
+	// 时间同步守护：时钟未校准会让依赖时间的协议"突然没网"，这里自动修复并供 UI/通知查询
+	timeGuard := system.NewTimeGuard(logger,
+		func() bool { v, ok := st.GetSetting("time_autofix"); return !ok || v != "false" },
+		func() string { v, _ := st.GetSetting("server_timezone"); return v })
+	alertMgr.TimeGuard = timeGuard
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	if err := ctl.Bootstrap(ctx); err != nil {
-		logger.Error("启动 gost 失败", "err", err)
-	}
-	ctl.RunSampler(ctx)
-	go alertMgr.Run(ctx)
 
 	webFS, err := fs.Sub(embeddedWeb, "web")
 	if err != nil {
 		logger.Error("加载前端资源失败", "err", err)
 		os.Exit(1)
 	}
+	// 先建 server：它向控制器注入订阅端口（ExtraPorts），Bootstrap 里的首次防火墙同步才不会
+	// 把订阅端口当成"多余的"先收回再放行一遍。
 	srv := server.New(cfg, ctl, webFS, logger)
 	server.Version = version
 	server.SetConfigPath(*confPath)
 	srv.SetRestartFunc(func() { restartPanel(mgr, logger) })
+	srv.SetTimeGuard(timeGuard)
+
+	if err := ctl.Bootstrap(ctx); err != nil {
+		logger.Error("启动 gost 失败", "err", err)
+	}
+	ctl.RunSampler(ctx)
+	go alertMgr.Run(ctx)
+	go timeGuard.Run(ctx)
 
 	// 订阅 HTTPS 证书管理器：内置 ACME 自动签发/续期，缓存于 DataDir/certs。
 	certDir := filepath.Join(cfg.DataDir, "certs")

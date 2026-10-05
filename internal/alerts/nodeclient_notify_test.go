@@ -39,6 +39,7 @@ func TestNodeClientNotify(t *testing.T) {
 		nodeConns:         map[string]uint64{},
 		quotaLevel:        map[string]int{},
 		windowKey:         map[string]int64{},
+		nodeExpired:       map[string]bool{},
 	}
 	m.Notify.Update(notify.Config{
 		Enabled: true, Token: "t", ChatID: "c",

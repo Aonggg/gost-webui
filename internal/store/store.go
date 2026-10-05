@@ -5,8 +5,9 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-
+	"os"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -57,10 +58,76 @@ func Open(path string) (*Store, error) {
 // Close 关闭数据库。
 func (s *Store) Close() error { return s.db.Close() }
 
-// BackupTo 把数据库一致性快照写入 w（bbolt WriteTo，不阻塞正常读写）。
+// BackupTo 把数据库一致性快照写入 w。
+// 快照先落到临时文件、剥离会话桶，再 Compact 成新文件后才输出：bbolt 删桶只是释放页面、不会清零，
+// 不压缩的话 7 天有效的登录令牌仍以原始字节留在备份文件里。
 func (s *Store) BackupTo(w io.Writer) error {
-	return s.db.View(func(tx *bolt.Tx) error {
-		_, err := tx.WriteTo(w)
+	snap, err := os.CreateTemp("", "panel-backup-*.db")
+	if err != nil {
+		return err
+	}
+	snapName := snap.Name()
+	defer os.Remove(snapName)
+	err = s.db.View(func(tx *bolt.Tx) error {
+		_, err := tx.WriteTo(snap)
+		return err
+	})
+	if cerr := snap.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := StripSessions(snapName); err != nil {
+		return err
+	}
+	outName := snapName + ".compact"
+	defer os.Remove(outName)
+	if err := compactDB(snapName, outName); err != nil {
+		return err
+	}
+	f, err := os.Open(outName)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(w, f)
+	return err
+}
+
+// compactDB 把 src 的有效数据复制到新文件 dst（丢弃已释放页面里的残留字节）。
+func compactDB(src, dst string) error {
+	in, err := bolt.Open(src, 0o600, &bolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := bolt.Open(dst, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return err
+	}
+	if err := bolt.Compact(out, in, 0); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// StripSessions 清空 path 指向的（未被打开的）面板数据库文件中的会话桶。
+// 用于备份导出与备份恢复：两边都不应携带登录态。
+func StripSessions(path string) error {
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return fmt.Errorf("打开数据库失败: %w", err)
+	}
+	defer db.Close()
+	return db.Update(func(tx *bolt.Tx) error {
+		if tx.Bucket(bucketSessions) != nil {
+			if err := tx.DeleteBucket(bucketSessions); err != nil {
+				return err
+			}
+		}
+		_, err := tx.CreateBucket(bucketSessions)
 		return err
 	})
 }
@@ -287,6 +354,26 @@ func (s *Store) GetSession(token string) (Session, bool) {
 func (s *Store) DeleteSession(token string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketSessions).Delete([]byte(token))
+	})
+}
+
+// DeleteSessionsExcept 删除除 keep 之外的全部会话（改密码后让其它登录态失效）。
+func (s *Store) DeleteSessionsExcept(keep string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSessions)
+		var keys [][]byte
+		c := b.Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			if string(k) != keep {
+				keys = append(keys, append([]byte(nil), k...))
+			}
+		}
+		for _, k := range keys {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

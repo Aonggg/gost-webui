@@ -278,3 +278,132 @@ func TestParseSSSynthesizedGost(t *testing.T) {
 		t.Fatalf("备注丢失: %s", out)
 	}
 }
+
+// socks5://user:pass@host:port：中转保留鉴权，只做 TCP 透传（不转发 UDP），Clash 输出 socks5。
+func TestParseSocks5Plain(t *testing.T) {
+	info, err := Parse("socks5://alice:p%40ss@1.2.3.4:1080#落地SOCKS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Scheme != "socks5" || info.Host != "1.2.3.4" || info.Port != 1080 || info.UDP || info.TLS {
+		t.Fatalf("解析错误: %+v", info)
+	}
+	if info.User != "alice" || info.proxyPass != "p@ss" || info.DisplayScheme() != "socks5" {
+		t.Fatalf("鉴权解析错误: user=%q pass=%q", info.User, info.proxyPass)
+	}
+	out, err := info.Rewrite("5.6.7.8", 30001, "SOCKS-中转", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(out, "socks5://alice:p%40ss@5.6.7.8:30001#") || strings.Contains(out, "sni=") {
+		t.Fatalf("改写错误: %s", out)
+	}
+	re, err := Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := re.ClashProxy("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p["type"] != "socks5" || p["server"] != "5.6.7.8" || p["port"] != 30001 || p["username"] != "alice" || p["password"] != "p@ss" || p["udp"] != false {
+		t.Fatalf("clash 配置错误: %+v", p)
+	}
+}
+
+// v2rayN 的两种 socks 分享写法：base64(user:pass)@host:port 与整段 base64(user:pass@host:port)。
+func TestParseSocksV2rayN(t *testing.T) {
+	cred := base64.StdEncoding.EncodeToString([]byte("bob:secret"))
+	info, err := Parse("socks://" + cred + "@9.9.9.9:1080#v2rayN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.User != "bob" || info.proxyPass != "secret" || info.DisplayScheme() != "socks5" {
+		t.Fatalf("base64 鉴权解析错误: %+v", info)
+	}
+	out, _ := info.Rewrite("5.6.7.8", 30002, "", "", "")
+	if !strings.HasPrefix(out, "socks://"+cred+"@5.6.7.8:30002#") {
+		t.Fatalf("改写应保留 base64 鉴权: %s", out)
+	}
+
+	whole := base64.StdEncoding.EncodeToString([]byte("bob:secret@9.9.9.9:1080"))
+	info2, err := Parse("socks://" + whole + "#旧格式")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info2.Host != "9.9.9.9" || info2.Port != 1080 || info2.User != "bob" || info2.proxyPass != "secret" || info2.Name != "旧格式" {
+		t.Fatalf("整段 base64 解析错误: %+v", info2)
+	}
+	out2, _ := info2.Rewrite("5.6.7.8", 30003, "", "", "")
+	if !strings.HasPrefix(out2, "socks://"+cred+"@5.6.7.8:30003#") {
+		t.Fatalf("整段 base64 应改写为 base64(user:pass)@host:port: %s", out2)
+	}
+	if _, err := Parse("socks5://9.9.9.9:1080"); err != nil {
+		t.Fatalf("无鉴权 socks5 应可解析: %v", err)
+	}
+}
+
+// http 代理：明文鉴权；https 代理：TLS + SNI 取落地域名，改写后链接与 Clash 都带上 SNI。
+func TestParseHTTPProxy(t *testing.T) {
+	info, err := Parse("http://u:p@proxy.example.com:3128#HTTP落地")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Scheme != "http" || info.TLS || info.UDP || info.User != "u" {
+		t.Fatalf("解析错误: %+v", info)
+	}
+	out, _ := info.Rewrite("5.6.7.8", 30004, "", "", "")
+	if !strings.HasPrefix(out, "http://u:p@5.6.7.8:30004#") {
+		t.Fatalf("改写错误: %s", out)
+	}
+	re, _ := Parse(out)
+	p, err := re.ClashProxy("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p["type"] != "http" || p["username"] != "u" || p["password"] != "p" || p["tls"] != nil {
+		t.Fatalf("clash 配置错误: %+v", p)
+	}
+
+	sec, err := Parse("https://u:p@proxy.example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sec.TLS || sec.SNI != "proxy.example.com" {
+		t.Fatalf("https 应启用 TLS 且 SNI 为落地域名: %+v", sec)
+	}
+	out2, _ := sec.Rewrite("5.6.7.8", 30005, "", "", "")
+	u, err := url.Parse(out2)
+	if err != nil || u.Host != "5.6.7.8:30005" || u.Query().Get("sni") != "proxy.example.com" {
+		t.Fatalf("https 改写应指向中转并带 sni: %s", out2)
+	}
+	re2, _ := Parse(out2)
+	p2, _ := re2.ClashProxy("")
+	if p2["type"] != "http" || p2["tls"] != true || p2["sni"] != "proxy.example.com" {
+		t.Fatalf("https clash 配置错误: %+v", p2)
+	}
+}
+
+// 手机扫码链接：socks/http 代理用 v2rayN 的 base64 鉴权写法（socks5 统一为 socks://），
+// 无鉴权不带 @；其它协议与 Rewrite 一致。
+func TestMobileShareLink(t *testing.T) {
+	info, _ := Parse("socks5://alice:p%40ss@1.2.3.4:1080#落地")
+	out, err := info.MobileShareLink("5.6.7.8", 30001, "中转", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := base64.StdEncoding.EncodeToString([]byte("alice:p@ss"))
+	if out != "socks://"+cred+"@5.6.7.8:30001#"+encodeFragment("中转") {
+		t.Fatalf("socks mobile link = %s", out)
+	}
+	plain, _ := Parse("http://9.9.9.9:3128")
+	if out, _ := plain.MobileShareLink("5.6.7.8", 30002, "", "", ""); out != "http://5.6.7.8:30002" {
+		t.Fatalf("http no-auth mobile link = %s", out)
+	}
+	vless, _ := Parse("vless://uuid@1.2.3.4:443?security=reality&sni=www.microsoft.com&pbk=k&sid=ab#r")
+	a, _ := vless.MobileShareLink("5.6.7.8", 30003, "", "", "")
+	b, _ := vless.Rewrite("5.6.7.8", 30003, "", "", "")
+	if a != b {
+		t.Fatalf("non-proxy schemes must match Rewrite: %s vs %s", a, b)
+	}
+}

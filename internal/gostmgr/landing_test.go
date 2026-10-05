@@ -19,8 +19,16 @@ func TestBuildLandingSS_TCP(t *testing.T) {
 	if !strings.Contains(yaml, "username: aes-256-gcm") || !strings.Contains(yaml, `password: "pass"`) {
 		t.Fatalf("凭据错误:\n%s", yaml)
 	}
-	if run != `gost -L "ss://aes-256-gcm:pass@:8388"` {
+	if run != `gost -L 'ss://aes-256-gcm:pass@:8388'` {
 		t.Fatalf("启动命令错误: %s", run)
+	}
+}
+
+func TestBuildLandingSS_ShellSpecialPassword(t *testing.T) {
+	// 密码里的 $ 、反引号、单引号都不能被 shell 解释
+	_, run := BuildLandingSS("x", "aes-256-gcm", "p$a`s'w", 8388, false)
+	if run != `gost -L 'ss://aes-256-gcm:p$a`+"`"+`s'\''w@:8388'` {
+		t.Fatalf("特殊字符密码未正确转义: %s", run)
 	}
 }
 

@@ -1,6 +1,6 @@
 services:
   gost-panel:
-    image: ghcr.io/baiduxc/gost-webui:latest
+    image: ghcr.io/aonggg/gost-webui:latest
     container_name: gost-webui
     restart: unless-stopped
     ports:

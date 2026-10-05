@@ -30,6 +30,9 @@ type Metrics struct {
 	HostUptime  int64   `json:"hostUptime"`
 	RuntimeOS   string  `json:"os"`
 	RuntimeArch string  `json:"arch"`
+	// ClockSynced 表示系统时钟是否已被 NTP 守护进程校准（nil = 无法判断）。
+	// 与 timedatectl 的 "System clock synchronized" 同源：读取内核 adjtimex 状态位 STA_UNSYNC。
+	ClockSynced *bool `json:"clockSynced"`
 }
 
 // Read 采集当前指标（读取失败时对应字段为 0）。
@@ -43,6 +46,7 @@ func Read() Metrics {
 	readMem(&m)
 	readDisk(&m)
 	readUptime(&m)
+	readClock(&m)
 	if m.CPUCount > 0 {
 		m.CPUPercent = round1(m.Load1 / float64(m.CPUCount) * 100)
 	}
@@ -128,6 +132,19 @@ func readUptime(m *Metrics) {
 			m.HostUptime = int64(v)
 		}
 	}
+}
+
+// staUnsync 是 linux/timex.h 中的 STA_UNSYNC：时钟未同步（NTP 守护进程成功对时后清除，
+// 长时间（约 9 小时）没有再次对时则由内核重新置位）。
+const staUnsync = 0x40
+
+func readClock(m *Metrics) {
+	var tx syscall.Timex
+	if _, err := syscall.Adjtimex(&tx); err != nil {
+		return
+	}
+	synced := tx.Status&staUnsync == 0
+	m.ClockSynced = &synced
 }
 
 func round1(v float64) float64 {

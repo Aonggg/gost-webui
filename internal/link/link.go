@@ -1,4 +1,5 @@
-// Package link 解析并改写 v2rayN 分享链接（vmess/vless/trojan/ss/hysteria2/tuic 等）。
+// Package link 解析并改写 v2rayN 分享链接（vmess/vless/trojan/ss/hysteria2/tuic 以及
+// http/https/socks5 代理链接）。
 //
 // 中转的核心思路：落地机的分享链接除了「地址 + 端口」以外的参数（UUID、密码、
 // TLS、SNI、WS 路径……）全部保持不变；把地址端口替换为中转机的即可。
@@ -28,6 +29,8 @@ type Info struct {
 	HostHdr   string `json:"hostHeader"`
 	// UDP 表示该协议依赖 UDP（QUIC/KCP 等），中转必须同时转发 UDP。
 	UDP bool `json:"udp"`
+	// User 是 http/socks 代理链接解析出的用户名（界面展示用；密码不下发）。
+	User string `json:"user,omitempty"`
 	// URI 型链接的原始片段（仅内部使用）。
 	rawScheme string
 	userinfo  string
@@ -35,6 +38,14 @@ type Info struct {
 	vmess     map[string]any
 	isVmess   bool
 	legacySS  *ssLegacy
+	// http/socks 代理的鉴权（从 userinfo 解析，支持明文与 v2rayN 的 base64 写法）
+	proxyUser string
+	proxyPass string
+}
+
+// Credentials 返回 http/socks 代理链接解析出的账号密码（明文或 v2rayN base64 写法均已解码）。
+func (i *Info) Credentials() (user, pass string) {
+	return i.proxyUser, i.proxyPass
 }
 
 type ssLegacy struct {
@@ -68,6 +79,10 @@ func Parse(raw string) (*Info, error) {
 		}
 	case "ss":
 		if err := info.parseSS(rest); err != nil {
+			return nil, err
+		}
+	case "http", "https", "socks", "socks5", "socks5h":
+		if err := info.parseProxyURI(rest); err != nil {
 			return nil, err
 		}
 	default:
@@ -244,6 +259,64 @@ func (i *Info) parseURI(rest string) error {
 	return nil
 }
 
+// parseProxyURI 解析 http / https / socks5 代理链接。除标准的
+// scheme://user:pass@host:port#name 外，兼容 v2rayN 的两种 base64 写法：
+// socks://base64(user:pass)@host:port#name 与 socks://base64(user:pass@host:port)#name。
+// 中转只做 TCP 透传：SOCKS5 的 UDP ASSOCIATE 会把客户端引向落地机真实地址，故不转发 UDP。
+func (i *Info) parseProxyURI(rest string) error {
+	body, frag := rest, ""
+	if k := strings.IndexByte(rest, '#'); k >= 0 {
+		body, frag = rest[:k], rest[k:]
+	}
+	wholeBase64 := false
+	if !strings.ContainsAny(body, "@?") {
+		// 没有 @ 的只能是 host:port（无鉴权）或整段 base64(user:pass@host:port)（旧版 v2rayN 分享格式）
+		if b, err := decodeBase64Loose(body); err == nil && strings.Contains(string(b), "@") {
+			rest = string(b) + frag
+			wholeBase64 = true
+		}
+	}
+	if err := i.parseURI(rest); err != nil {
+		return err
+	}
+	i.parseProxyAuth()
+	if wholeBase64 && i.proxyUser != "" {
+		// 改写后的链接统一用 v2rayN 能识别的 base64(user:pass)@host:port 形式
+		i.userinfo = base64.StdEncoding.EncodeToString([]byte(i.proxyUser + ":" + i.proxyPass))
+	}
+	if i.Scheme == "https" {
+		i.TLS = true
+		if i.SNI == "" {
+			i.SNI = i.Host
+		}
+	}
+	return nil
+}
+
+// parseProxyAuth 从 userinfo 取出账号密码：user:pass（百分号编码）或 base64(user:pass)。
+func (i *Info) parseProxyAuth() {
+	ui := i.userinfo
+	if ui == "" {
+		return
+	}
+	if k := strings.IndexByte(ui, ':'); k >= 0 {
+		u, _ := url.PathUnescape(ui[:k])
+		p, _ := url.PathUnescape(ui[k+1:])
+		i.proxyUser, i.proxyPass = u, p
+	} else if b, err := decodeBase64Loose(ui); err == nil && len(b) > 0 {
+		s := string(b)
+		if k := strings.IndexByte(s, ':'); k >= 0 {
+			i.proxyUser, i.proxyPass = s[:k], s[k+1:]
+		} else {
+			i.proxyUser = s
+		}
+	} else {
+		u, _ := url.PathUnescape(ui)
+		i.proxyUser = u
+	}
+	i.User = i.proxyUser
+}
+
 // Rewrite 返回把地址端口替换为中转机后的新链接。
 // sni / hostHeader 非空时覆盖原值（用于手动纠正）。
 func (i *Info) Rewrite(host string, port int, name, sni, hostHeader string) (string, error) {
@@ -370,11 +443,45 @@ func (i *Info) rewriteURI(host string, port int, name, sni, hostHeader string) (
 	return sb.String(), nil
 }
 
+// MobileShareLink 返回手机客户端（Shadowrocket / v2rayNG / v2rayN）扫码导入用的链接。
+// http / socks 代理链接改写为 v2rayN 约定的 scheme://base64(user:pass)@host:port#name
+// （socks5/socks5h 统一为 socks://）；其它协议与 Rewrite 相同。
+func (i *Info) MobileShareLink(host string, port int, name, sni, hostHeader string) (string, error) {
+	switch i.Scheme {
+	case "http", "https", "socks", "socks5", "socks5h":
+	default:
+		return i.Rewrite(host, port, name, sni, hostHeader)
+	}
+	if host == "" || port <= 0 || port > 65535 {
+		return "", fmt.Errorf("无效的中转地址 %s:%d", host, port)
+	}
+	scheme := i.Scheme
+	if strings.HasPrefix(scheme, "socks") {
+		scheme = "socks"
+	}
+	var sb strings.Builder
+	sb.WriteString(scheme)
+	sb.WriteString("://")
+	if i.proxyUser != "" {
+		sb.WriteString(base64.StdEncoding.EncodeToString([]byte(i.proxyUser + ":" + i.proxyPass)))
+		sb.WriteByte('@')
+	}
+	sb.WriteString(joinHostPort(host, port))
+	if name == "" {
+		name = i.Name
+	}
+	if name != "" {
+		sb.WriteByte('#')
+		sb.WriteString(encodeFragment(name))
+	}
+	return sb.String(), nil
+}
+
 // ClashProxy 把已解析的链接转换为 Clash Meta（mihomo）的单个 proxy 配置。
 // server / port 直接取 Info 中的值（调用前应已通过 Rewrite 指向中转机），
 // 其余鉴权/传输参数沿用原链接。name 为空时回退到链接备注名。
 //
-// 支持 ss / vmess / vless / trojan / hysteria2 / tuic；其它协议返回错误，
+// 支持 ss / vmess / vless / trojan / hysteria2 / tuic / http(s) / socks5；其它协议返回错误，
 // 由调用方决定跳过。
 func (i *Info) ClashProxy(name string) (map[string]any, error) {
 	if name == "" {
@@ -409,6 +516,10 @@ func (i *Info) ClashProxy(name string) (map[string]any, error) {
 		return i.clashHysteria2(name, server, port, get)
 	case "tuic":
 		return i.clashTuic(name, server, port, get)
+	case "http", "https":
+		return i.clashHTTP(name, server, port), nil
+	case "socks", "socks5", "socks5h":
+		return i.clashSocks5(name, server, port), nil
 	default:
 		return nil, fmt.Errorf("订阅暂不支持的协议: %s", i.Scheme)
 	}
@@ -510,7 +621,9 @@ func (i *Info) clashVless(name, server string, port int, get func(...string) str
 	sec := strings.ToLower(get("security", "tls"))
 	if i.TLS || sec == "tls" || sec == "reality" || sec == "xtls" {
 		p["tls"] = true
-		p["skip-cert-verify"] = false
+		// allowInsecure=1 / insecure=1：自签证书（如面板 WS+TLS 源站直连）→ 跳过校验
+		ai := strings.ToLower(get("allowInsecure", "insecure"))
+		p["skip-cert-verify"] = ai == "1" || ai == "true"
 		sni := i.SNI
 		if sni == "" {
 			sni = get("sni", "servername", "peer")
@@ -625,6 +738,32 @@ func (i *Info) clashTuic(name, server string, port int, get func(...string) stri
 	return p, nil
 }
 
+// clashHTTP 生成 Clash 的 http 代理；https 链接对应 tls: true（SNI 为落地域名，改写时已随链接带上）。
+func (i *Info) clashHTTP(name, server string, port int) map[string]any {
+	p := map[string]any{"name": name, "type": "http", "server": server, "port": port}
+	if i.proxyUser != "" {
+		p["username"] = i.proxyUser
+		p["password"] = i.proxyPass
+	}
+	if i.TLS {
+		p["tls"] = true
+		if i.SNI != "" {
+			p["sni"] = i.SNI
+		}
+	}
+	return p
+}
+
+// clashSocks5 生成 Clash 的 socks5 代理；中转不转发 UDP，故 udp: false。
+func (i *Info) clashSocks5(name, server string, port int) map[string]any {
+	p := map[string]any{"name": name, "type": "socks5", "server": server, "port": port, "udp": false}
+	if i.proxyUser != "" {
+		p["username"] = i.proxyUser
+		p["password"] = i.proxyPass
+	}
+	return p
+}
+
 // ---------- 工具函数 ----------
 
 func isWS(transport string) bool {
@@ -732,6 +871,8 @@ func (i *Info) DisplayScheme() string {
 		return "hysteria2"
 	case "ss":
 		return "shadowsocks"
+	case "socks", "socks5h":
+		return "socks5"
 	}
 	return i.Scheme
 }

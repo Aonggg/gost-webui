@@ -123,6 +123,27 @@ func (c *Client) DeleteService(ctx context.Context, name string) error {
 	return err
 }
 
+// UpsertChain 新建或更新转发链（出口代理）。
+func (c *Client) UpsertChain(ctx context.Context, ch *Chain) error {
+	err := c.do(ctx, http.MethodPost, "/config/chains", ch, nil)
+	if err == nil {
+		return nil
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		return err
+	}
+	return c.do(ctx, http.MethodPut, "/config/chains/"+url.PathEscape(ch.Name), ch, nil)
+}
+
+// DeleteChain 删除转发链（不存在视为成功）。
+func (c *Client) DeleteChain(ctx context.Context, name string) error {
+	err := c.do(ctx, http.MethodDelete, "/config/chains/"+url.PathEscape(name), nil, nil)
+	if err != nil && strings.Contains(err.Error(), "not found") {
+		return nil
+	}
+	return err
+}
+
 // Quotas 拉取配额列表（含用量状态）。
 func (c *Client) Quotas(ctx context.Context) ([]*Quota, error) {
 	var list struct {

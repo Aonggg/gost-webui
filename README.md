@@ -4,6 +4,9 @@
 既能粘贴已有落地链接做中转，也能把当前服务器或远程服务器直接配置成 GOST 落地；
 同时提供流量统计、流量配额、限速、Telegram 告警和 Web 管理界面。
 
+> 本仓库由 [baiduxc/gost-webui](https://github.com/baiduxc/gost-webui) 二次开发而来（MIT），
+> 在其基础上新增节点到期、时间同步守护、防火墙自动放行、VMess / WebSocket 加速兼容模式、HTTP / SOCKS5 落地与出口代理等功能，并修复了一轮安全与稳定性问题（见 [CHANGELOG](CHANGELOG.md)）。
+
 ```
 客户端 ──① 使用面板生成的新链接──► 中转机（面板 + gost） ──② 原始转发──► 落地机（xray/v2ray 等）
 客户端 ───────────────────────────► 本机落地（面板直接管理 GOST 代理服务）
@@ -14,11 +17,13 @@
 - **一键安装**：自动安装 Go、gost、面板，并注册 systemd 服务
 - **粘贴即用**：支持 `vmess://` `vless://` `trojan://` `ss://` `hysteria2://` `tuic://`，
   自动解析参数、自动补 SNI/Host、UDP 协议自动开启 UDP 转发，并生成新链接与二维码
-- **VLESS + REALITY**：添加节点选择「VLESS + REALITY」，面板自动拉起 sing-box 引擎：伪装域名握手、免证书、抗探测；一键生成密钥对/UUID/ShortID，订阅同时输出 `vless://…security=reality` 与 Clash Meta 配置（与 gost 节点并存）
+- **HTTP / SOCKS5 落地中转**：选类型、填落地机 IP / 端口 / 账号 / 密码即可（或粘贴 `http://` `socks5://` 地址），客户端用同样账号密码连本机端口；国内客户端请改用**出口代理**：客户端走 REALITY / Shadowsocks 连本机，本机再经落地机的 SOCKS5 / HTTP 出站
+- **VLESS + REALITY**：添加节点选择「VLESS + REALITY」，面板自动拉起 sing-box 引擎：伪装域名握手、免证书、抗探测；伪装域名留空自动从微软/苹果/亚马逊等大型站点中挑选（本机实测 TLS 1.3 + H2 可达）；一键生成密钥对/UUID/ShortID，订阅同时输出 `vless://…security=reality` 与 Clash Meta 配置（与 gost 节点并存）。要经国内加速/中转时打开「支持被加速中转」开关：默认 VMess + TCP（纯 TCP 转发类加速直接透传），也可选 VLESS + WebSocket（CDN / HTTP 回源类），填加速入口即可直接生成客户端链接
 - **本机也能落地**：添加节点时选择「GOST 体系 → 本机」，HTTP、SOCKS、SS、Relay、SNI 服务直接加入面板管理的 GOST 进程
 - **完整 GOST 协议层**：代理协议与传输通道独立选择，覆盖 TCP/UDP、TLS/DTLS、WS、HTTP/2、gRPC、KCP、QUIC、HTTP/3、WebTransport、SSH、ICMP 等官方通道
 - **流量统计**：今日 / 本月 / 累计流量、连接数、节点流量曲线
 - **流量配额**：每日 / 每月 / 总量，双向或单向计数，**超限自动暂停、新周期自动恢复**
+- **到期时间**：按节点设置到期时间（北京时间），**到期自动停止服务**，延长时间即恢复
 - **限速 / 并发限制**：按节点限制上下行速率与最大连接数
 - **Telegram 通知**：节点上下线、流量预警、CPU/内存/磁盘负载、面板启停
 - **Web 管理**：改端口、改访问路径、重启面板、查看日志、一键开关节点
@@ -26,10 +31,10 @@
 
 ## 一键安装
 
-**环境要求**：Linux（amd64 / arm64）、root 权限、服务器可以访问 GitHub。
+**环境要求**：Ubuntu 20.04+ / Debian 11+（其它 systemd 发行版通常也可以），amd64 / arm64，root 权限，服务器可以访问 GitHub。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/baiduxc/gost-webui/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Aonggg/gost-webui/main/install.sh | sudo bash
 ```
 
 安装完成后会打印面板地址、用户名和登录密码。默认监听 `8787` 端口。
@@ -37,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/baiduxc/gost-webui/main/install.sh 
 **自定义端口 / 账号密码 / 访问路径**：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/baiduxc/gost-webui/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/Aonggg/gost-webui/main/install.sh \
   | sudo bash -s -- --port 9000 --path /panel --user admin --pass '你的密码'
 ```
 
@@ -53,8 +58,16 @@ cd gost-webui && sudo bash install.sh
 sudo bash install.sh --gost-bin /root/gost --panel-bin /root/gost-webui
 ```
 
-> 安装过程会自动：放行本机防火墙端口、探测公网 IP、生成随机密码、注册 systemd 服务。
-> 云服务器还需要在**控制台安全组**放行面板端口（以及转发节点使用的端口）。
+> 安装过程会自动：安装基础依赖、校准系统时间与时区、放行本机防火墙端口、探测公网 IP、生成随机密码、注册 systemd 服务；
+> 之后面板创建的每个节点端口也会自动放行（ufw / firewalld / iptables）。
+> 云服务器还需要在**控制台安全组**放行面板端口（以及转发节点使用的端口）——这一步面板管不到。
+
+**卸载**（停止服务、收回面板放行过的防火墙端口、删除程序与配置；`KEEP_DATA=1` 可保留数据与日志）：
+
+```bash
+sudo bash /opt/gost-webui/install.sh --uninstall
+# 或在 go-ui 菜单中选择「干净卸载」
+```
 
 ## Docker 部署
 
@@ -69,7 +82,7 @@ docker run -d --name gost-webui \
   -v gost-data:/var/lib/gost-webui \
   -v gost-logs:/var/log/gost-webui \
   -v gost-conf:/etc/gost-webui \
-  ghcr.io/baiduxc/gost-webui:latest
+  ghcr.io/aonggg/gost-webui:latest
 ```
 
 打开 `http://服务器IP:8787` 用上面设置的账号登录。节点转发端口按需再加 `-p 45678:45678`。
@@ -86,7 +99,7 @@ docker run -d --name gost-webui \
   -v /opt/gost-webui/data:/var/lib/gost-webui \
   -v /opt/gost-webui/logs:/var/log/gost-webui \
   -v /opt/gost-webui/conf:/etc/gost-webui \
-  ghcr.io/baiduxc/gost-webui:latest
+  ghcr.io/aonggg/gost-webui:latest
 ```
 
 或使用仓库中的 compose 文件（编辑好密码后）：
@@ -121,6 +134,7 @@ docker compose up -d
 go-ui                 # SSH 管理菜单：改密码/端口/路径、重启、日志、卸载
 go-ui status          # 查看运行状态
 go-ui passwd          # 修改管理员账号密码
+go-ui timesync        # 检查/校准系统时间（NTP 不通也能按 HTTPS 时间校正）
 ```
 
 ```bash

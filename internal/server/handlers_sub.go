@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -62,7 +63,9 @@ func (s *Server) handleNodeSubscription(w http.ResponseWriter, r *http.Request) 
 	}
 	base := s.subBaseURL()
 	token := node.SubToken
-	clashSupported := node.Mode != "gost" || (gostmgr.NodeGostProtocol(node) == "ss" && gostmgr.NodeGostTransport(node) == "tcp")
+	// Clash 能表达的 gost 本机节点：标准 ss / http / socks5 直接走 TCP（叠加 ws/tls 等通道的组合 Clash 无对应类型）
+	gp, gt := gostmgr.NodeGostProtocol(node), gostmgr.NodeGostTransport(node)
+	clashSupported := node.Mode != "gost" || (gt == "tcp" && (gp == "ss" || gp == "http" || gp == "socks5"))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"url":            base + "/" + token,
 		"clashURL":       base + "/" + token + "/clash",
@@ -74,6 +77,7 @@ func (s *Server) handleNodeSubscription(w http.ResponseWriter, r *http.Request) 
 		"suffix":         set.Suffix,
 		"certReady":      s.certReady(),
 		"enabled":        node.Enabled,
+		"expired":        node.Expired(),
 		"nodeName":       node.Name,
 		"clashSupported": clashSupported,
 	})
@@ -111,6 +115,10 @@ func (s *Server) subConfigView(ctx context.Context) map[string]any {
 	} else if prov := s.certProvider(); prov != nil {
 		certPEM, keyPEM, certSource = prov.Content(ctx)
 	}
+	var listenErr string
+	if err := s.SubError(); err != nil {
+		listenErr = err.Error()
+	}
 	return map[string]any{
 		"port":          set.Port,
 		"suffix":        set.Suffix,
@@ -123,6 +131,9 @@ func (s *Server) subConfigView(ctx context.Context) map[string]any {
 		"certPEM":       certPEM,
 		"keyPEM":        keyPEM,
 		"certSource":    certSource,
+		// listening / listenError：订阅监听器实际状态；端口被占用时前端据此提示，而不是只在日志里留一行 WARN。
+		"listening":   listenErr == "",
+		"listenError": listenErr,
 	}
 }
 
@@ -151,13 +162,22 @@ func (s *Server) handleSubConfigPut(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "订阅端口无效（1-65535）")
 			return
 		}
+		if *req.Port == s.panelPort() {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("订阅端口不能与面板端口 %d 相同", *req.Port))
+			return
+		}
 		if err := st.SetSetting("sub_port", strconv.Itoa(*req.Port)); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 	}
 	if req.Suffix != nil {
-		if err := st.SetSetting("sub_suffix", normalizeSubSuffix(*req.Suffix)); err != nil {
+		sfx, ok := normalizeSubSuffix(*req.Suffix)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "订阅路径只能由字母、数字和 . _ - ~ 组成，用 / 分段（如 /sub）")
+			return
+		}
+		if err := st.SetSetting("sub_suffix", sfx); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -196,8 +216,14 @@ func (s *Server) handleSubConfigPut(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// 热生效：重建订阅监听器（无需重启面板）。
-	s.RestartSubscription()
+	// 热生效：重建订阅监听器（无需重启面板），并同步防火墙放行订阅端口。
+	// 监听失败（端口被占用）时设置已保存，但要把失败原因直接告诉用户。
+	listenErr := s.RestartSubscription()
+	s.ctl.SyncFirewall(sysCtx(r))
+	if listenErr != nil {
+		writeErr(w, http.StatusConflict, listenErr.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, s.subConfigView(r.Context()))
 }
 

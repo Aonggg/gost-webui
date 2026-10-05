@@ -43,7 +43,7 @@
       <a href="#system" data-view="system"><span data-icon="settings"></span>系统设置</a>
     </nav>
       <div class="actions">
-        <a class="btn ghost sm" href="https://github.com/baiduxc/Gost-webui" target="_blank" rel="noopener noreferrer" title="GitHub 仓库" aria-label="GitHub 仓库" style="text-decoration:none"><svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12z"/></svg></a>
+        <a class="btn ghost sm" href="https://github.com/Aonggg/gost-webui" target="_blank" rel="noopener noreferrer" title="GitHub 仓库" aria-label="GitHub 仓库" style="text-decoration:none"><svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12z"/></svg></a>
         <button class="btn ghost sm" id="themeBtn" title="切换主题"><span data-icon="moon"></span></button>
         <button class="btn ghost sm" id="refreshBtn" title="刷新"><span data-icon="refresh"></span></button>
         <div class="dropdown" id="userDropdown">
@@ -102,7 +102,7 @@
               <button class="btn" id="addNodeBtn"><span data-icon="plus"></span>添加节点</button>
             </div>
             <div class="table-wrap" id="nodeTable"></div>
-            <details class="relay-note"><summary>关于中转连接</summary><p>纯 TCP 四层透传。GOST 负责端口转发与流量管控；Reality / VLESS 握手端到端直达落地机，落地机无需安装 GOST。</p></details>
+            <details class="relay-note"><summary>关于中转连接</summary><p>纯 TCP 四层透传。GOST 负责端口转发与流量管控；Reality / VLESS 握手端到端直达落地机，落地机无需安装 GOST。落地机也可以是普通 HTTP / SOCKS5 代理（粘贴 http:// 或 socks5:// 地址），客户端照常用 HTTP / SOCKS5 连接本机端口即可；SOCKS5 的 UDP 不经中转。</p></details>
           </div>
         </div>
       </section>
@@ -248,6 +248,13 @@
           </div>
           <div class="hint" style="margin-bottom:8px">日常选「关闭」不留任何访问记录；需要排障时再切到 info，保存后自动重启 gost 生效。</div>
           <button class="btn secondary sm" id="saveStatsBtn">保存统计设置</button>
+
+          <div class="section-label">防火墙</div>
+          <div class="field">
+            <label class="switch"><input type="checkbox" id="fwAuto"><span class="track"></span>
+              <span><span class="txt">自动放行节点端口</span><span class="desc">创建/启用节点时在本机防火墙（ufw / firewalld / iptables）放行监听端口，删除/停用时收回；订阅端口一并放行。云服务器还需在控制台安全组放行。</span></span></label>
+          </div>
+          <div class="hint" id="fwInfo"></div>
         </div>
 
         <div class="card">
@@ -321,6 +328,31 @@
 
         <div class="card">
           <div class="card-head">
+            <div><h2>时间同步</h2><div class="desc">时钟不准会让 VMess / SS2022 / 带时间校验的 REALITY 等协议握手失败、节点「突然没网」；面板会自动校时，这里可查看与手动处理</div></div>
+            <div class="btn-group">
+              <button class="btn secondary sm" id="timeFixBtn">立即校时</button>
+            </div>
+          </div>
+          <div class="kv" id="timeInfo"></div>
+          <div class="row" style="margin-top:16px">
+            <div class="field">
+              <label class="switch"><input type="checkbox" id="timeAutofix"><span class="track"></span>
+                <span><span class="txt">自动校时</span><span class="desc">检测到时钟未同步时自动启用/安装 NTP；NTP 不可达则按 HTTPS 站点时间校正（每分钟检测，失败按退避重试）</span></span></label>
+            </div>
+            <div class="field">
+              <label for="timeZone">服务器时区</label>
+              <div class="row tight">
+                <input id="timeZone" type="text" placeholder="如 Asia/Shanghai，留空不管理">
+                <button class="btn secondary sm" id="timeZoneBtn" style="flex:0 0 auto">应用</button>
+              </div>
+              <div class="hint">写入 timedatectl set-timezone；面板本身的到期/配额已固定按北京时间，这里只影响系统 date / 日志</div>
+            </div>
+          </div>
+          <pre class="code-box hidden" id="timeLast" style="margin-top:12px;white-space:pre-wrap"></pre>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
             <div><h2>数据备份</h2><div class="desc">导出/恢复面板数据库（节点、设置、流量统计），升级或迁移前建议先备份；恢复会自动重启面板</div></div>
             <div class="btn-group">
               <button class="btn secondary sm" id="backupBtn">下载备份</button>
@@ -337,7 +369,7 @@
     <footer class="app-footer"><span id="footerVersion">Gost-WebUI</span>    <div class="footer-status">
       <span class="status-dot" id="gostDot"></span>
       <span id="gostText">gost 状态检测中</span>
-    </div><span>by <a href="https://github.com/baiduxc/Gost-webui" target="_blank" rel="noopener noreferrer"><i>599</i></a></span></footer>
+    </div><span>by <a href="https://github.com/Aonggg/gost-webui" target="_blank" rel="noopener noreferrer"><i>599</i></a></span></footer>
   </main>
 </div>
 

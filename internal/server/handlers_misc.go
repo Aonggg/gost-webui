@@ -24,7 +24,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	nodes := s.ctl.Nodes()
 
 	var todayIn, todayOut, monthIn, monthOut, totalIn, totalOut uint64
-	var curConns, totalConns, blocked uint64
+	var curConns, totalConns, blocked, expired uint64
 	enabled := 0
 	type nodeStat struct {
 		ID      string `json:"id"`
@@ -33,6 +33,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		In      uint64 `json:"in"`
 		Out     uint64 `json:"out"`
 		Blocked bool   `json:"blocked"`
+		Expired bool   `json:"expired"`
 	}
 	stats := make([]nodeStat, 0, len(nodes))
 
@@ -51,6 +52,9 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		if lv.QuotaBlocked {
 			blocked++
 		}
+		if n.Expired() {
+			expired++
+		}
 		var nIn, nOut uint64
 		if pts, err := s.ctl.Store.RangeTraffic(n.ID, startOfMonth.Unix(), now.Unix()+1); err == nil {
 			for _, p := range pts {
@@ -64,7 +68,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		stats = append(stats, nodeStat{ID: n.ID, Name: n.Name, Enabled: n.Enabled, In: nIn, Out: nOut, Blocked: lv.QuotaBlocked})
+		stats = append(stats, nodeStat{ID: n.ID, Name: n.Name, Enabled: n.Enabled, In: nIn, Out: nOut, Blocked: lv.QuotaBlocked, Expired: n.Expired()})
 	}
 	sort.Slice(stats, func(i, j int) bool { return stats[i].In+stats[i].Out > stats[j].In+stats[j].Out })
 	if len(stats) > 5 {
@@ -113,6 +117,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"publicHost":        host,
 		"publicHostPrivate": isPrivateHost(host),
+		"timeState":         s.timeState(),
 		"host": map[string]any{
 			"metrics":   met,
 			"sampledAt": metAt.Unix(),
@@ -128,6 +133,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 			"total":        len(nodes),
 			"enabled":      enabled,
 			"blocked":      blocked,
+			"expired":      expired,
 			"currentConns": curConns,
 			"totalConns":   totalConns,
 		},
@@ -159,14 +165,20 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	title, _ := s.ctl.Store.GetSetting("site_title")
+	serverTZ, _ := s.ctl.Store.GetSetting("server_timezone")
 	writeJSON(w, http.StatusOK, map[string]any{
-		"publicHost":    s.publicHost(),
-		"configured":    s.configuredHost(),
-		"siteTitle":     title,
-		"sampleSeconds": sample,
-		"retentionDays": retention,
-		"gostLogLevel":  gostLogLvl,
-		"username":      s.adminUser(),
+		"publicHost":     s.publicHost(),
+		"configured":     s.configuredHost(),
+		"siteTitle":      title,
+		"sampleSeconds":  sample,
+		"retentionDays":  retention,
+		"gostLogLevel":   gostLogLvl,
+		"timeAutofix":    s.timeAutofix(),
+		"serverTimezone": serverTZ,
+		"firewallAuto":   s.ctl.FirewallAuto(),
+		"firewallKind":   string(system.DetectFirewall(r.Context())),
+		"managedPorts":   s.ctl.ManagedPorts(),
+		"username":       s.adminUser(),
 		"gost": map[string]any{
 			"bin":        s.cfg.Gost.Bin,
 			"configFile": s.cfg.Gost.ConfigFile,
@@ -191,6 +203,11 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		SampleSeconds *int    `json:"sampleSeconds"`
 		RetentionDays *int    `json:"retentionDays"`
 		GostLogLevel  *string `json:"gostLogLevel"`
+		// TimeAutofix 自动校时开关；ServerTimezone 系统时区（IANA 名，空 = 不管理）
+		TimeAutofix    *bool   `json:"timeAutofix"`
+		ServerTimezone *string `json:"serverTimezone"`
+		// FirewallAuto 自动放行节点端口开关
+		FirewallAuto *bool `json:"firewallAuto"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求格式错误")
@@ -247,6 +264,34 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 					s.ctl.Gost.ClearLog()
 				}
 			}
+		}
+	}
+	if req.TimeAutofix != nil {
+		_ = s.ctl.Store.SetSetting("time_autofix", strconv.FormatBool(*req.TimeAutofix))
+	}
+	if req.FirewallAuto != nil {
+		_ = s.ctl.Store.SetSetting("fw_autoopen", strconv.FormatBool(*req.FirewallAuto))
+		s.ctl.SyncFirewall(sysCtx(r)) // 开：补放行；关：收回自己放行过的
+	}
+	if req.ServerTimezone != nil {
+		tz := strings.TrimSpace(*req.ServerTimezone)
+		if tz != "" {
+			if _, err := time.LoadLocation(tz); err != nil {
+				writeErr(w, http.StatusBadRequest, "时区无效，请填写如 Asia/Shanghai 的 IANA 时区名")
+				return
+			}
+			if _, err := system.EnsureTimezone(sysCtx(r), tz); err != nil {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if err := system.ApplyProcessTimezone(tz); err != nil {
+				writeErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		if err := s.ctl.Store.SetSetting("server_timezone", tz); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
 		}
 	}
 	out := map[string]any{"ok": true}
@@ -330,6 +375,15 @@ func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "备份文件不包含面板数据（meta 桶缺失）")
 		return
 	}
+	// 备份里若带有旧登录令牌（老版本导出的备份），恢复时一并清掉
+	if err := store.StripSessions(tmpName); err != nil {
+		writeErr(w, http.StatusBadRequest, "备份文件处理失败: "+err.Error())
+		return
+	}
+	if data, err = os.ReadFile(tmpName); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 
 	target := s.ctl.Store.Path()
 	bak := target + ".pre-restore"
@@ -386,6 +440,12 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 密码换了，其它地方已登录的会话全部作废（当前这个浏览器保留）
+	keep := ""
+	if c, err := r.Cookie(cookieName); err == nil {
+		keep = c.Value
+	}
+	s.sess.removeAllExcept(keep)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

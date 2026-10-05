@@ -15,6 +15,7 @@ import (
 
 type Config struct {
 	Services  []*Service `yaml:"services" json:"services"`
+	Chains    []*Chain   `yaml:"chains,omitempty" json:"chains,omitempty"`
 	Quotas    []*Quota   `yaml:"quotas,omitempty" json:"quotas,omitempty"`
 	Limiters  []*Limiter `yaml:"limiters,omitempty" json:"limiters,omitempty"`
 	CLimiters []*Limiter `yaml:"climiters,omitempty" json:"climiters,omitempty"`
@@ -36,7 +37,9 @@ type Service struct {
 }
 
 type Handler struct {
-	Type     string         `yaml:"type" json:"type"`
+	Type string `yaml:"type" json:"type"`
+	// Chain 指定出站所走的转发链（出口代理）。
+	Chain    string         `yaml:"chain,omitempty" json:"chain,omitempty"`
 	Auth     *Auth          `yaml:"auth,omitempty" json:"auth,omitempty"`
 	Metadata map[string]any `yaml:"metadata,omitempty" json:"metadata,omitempty"`
 }
@@ -54,6 +57,72 @@ type Forwarder struct {
 type ForwardNode struct {
 	Name string `yaml:"name,omitempty" json:"name,omitempty"`
 	Addr string `yaml:"addr" json:"addr"`
+}
+
+// Chain / Hop / ChainNode 对应 gost 的转发链：服务通过 handler.chain 引用，
+// 出站连接经链上节点（这里是落地机的 SOCKS5 / HTTP 代理）发出。
+type Chain struct {
+	Name string `yaml:"name" json:"name"`
+	Hops []*Hop `yaml:"hops" json:"hops"`
+}
+
+type Hop struct {
+	Name  string       `yaml:"name" json:"name"`
+	Nodes []*ChainNode `yaml:"nodes" json:"nodes"`
+}
+
+type ChainNode struct {
+	Name      string     `yaml:"name" json:"name"`
+	Addr      string     `yaml:"addr" json:"addr"`
+	Connector *Connector `yaml:"connector" json:"connector"`
+	Dialer    *Dialer    `yaml:"dialer" json:"dialer"`
+}
+
+type Connector struct {
+	Type     string         `yaml:"type" json:"type"`
+	Auth     *Auth          `yaml:"auth,omitempty" json:"auth,omitempty"`
+	Metadata map[string]any `yaml:"metadata,omitempty" json:"metadata,omitempty"`
+}
+
+type Dialer struct {
+	Type string `yaml:"type" json:"type"`
+	// TLS 是 tls 拨号器的证书校验选项（gost 只认 dialer.tls，写进 metadata 会被忽略）。
+	TLS      *DialerTLS     `yaml:"tls,omitempty" json:"tls,omitempty"`
+	Metadata map[string]any `yaml:"metadata,omitempty" json:"metadata,omitempty"`
+}
+
+type DialerTLS struct {
+	ServerName string `yaml:"serverName,omitempty" json:"serverName,omitempty"`
+	Secure     bool   `yaml:"secure,omitempty" json:"secure,omitempty"`
+}
+
+// ChainName 是节点出口代理链在 gost 内的名字。
+func ChainName(id string) string { return "chain-" + id }
+
+// BuildChain 把节点的出口代理转成 gost 转发链；没有出口代理时返回 nil。
+// socks5 / http 连接器直连代理；https 为 http 连接器 + TLS 拨号（SNI 取代理域名）。
+func BuildChain(n *model.Node) *Chain {
+	if !n.HasUpstream() {
+		return nil
+	}
+	up := n.Upstream
+	var auth *Auth
+	if up.User != "" {
+		auth = &Auth{Username: up.User, Password: up.Pass}
+	}
+	node := &ChainNode{Name: "exit", Addr: up.Addr(), Dialer: &Dialer{Type: "tcp"}}
+	switch up.Type {
+	case "http":
+		node.Connector = &Connector{Type: "http", Auth: auth}
+	case "https":
+		node.Connector = &Connector{Type: "http", Auth: auth}
+		node.Dialer = &Dialer{Type: "tls", TLS: &DialerTLS{ServerName: up.Host, Secure: true}}
+	default:
+		// notls：只协商标准方法 [无鉴权, 用户名密码]。gost 默认额外提供私有方法 0x80/0x82，
+		// 不少第三方 SOCKS5 落地（商业代理）遇到未知方法会直接断开（unexpected EOF）。
+		node.Connector = &Connector{Type: "socks5", Auth: auth, Metadata: map[string]any{"notls": true}}
+	}
+	return &Chain{Name: ChainName(n.ID), Hops: []*Hop{{Name: "exit", Nodes: []*ChainNode{node}}}}
 }
 
 type Quota struct {
@@ -146,7 +215,7 @@ func BuildConfig(nodes []*model.Node, opts BuildOptions) *Config {
 	}
 
 	for _, n := range nodes {
-		if n == nil || !n.Enabled || n.IsReality() {
+		if n == nil || !n.Serving() || n.IsReality() {
 			continue
 		}
 		var quotas []string
@@ -186,6 +255,12 @@ func BuildConfig(nodes []*model.Node, opts BuildOptions) *Config {
 		var services []*Service
 		if n.Mode == "gost" && n.GostLocal {
 			services = BuildGostProxyServices(n, n.ListenPort)
+			if ch := BuildChain(n); ch != nil {
+				cfg.Chains = append(cfg.Chains, ch)
+				for _, service := range services {
+					service.Handler.Chain = ch.Name
+				}
+			}
 		} else {
 			target := fmt.Sprintf("%s:%d", n.TargetHost, n.TargetPort)
 			network := "tcp"
@@ -269,7 +344,7 @@ func BuildGostProxyServices(n *model.Node, port int) []*Service {
 		Handler:  handler,
 		Listener: listener,
 	}}
-	if n.UDP && protocol == "ss" {
+	if n.UDP && protocol == "ss" && !n.HasUpstream() { // 出口代理只走 TCP，不生成 UDP 服务
 		services = append(services, &Service{
 			Name:     model.UDPName(n.ID),
 			Addr:     fmt.Sprintf(":%d", port),

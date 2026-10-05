@@ -15,6 +15,7 @@
 #   GO_VERSION=1.26.8
 #   GOST_REF=master         gost 源码分支/标签/提交
 #   NO_SYSTEMD=1            不安装 systemd 服务（仅部署文件）
+#   TIMEZONE=Asia/Shanghai  安装时设置的系统时区（置空则不改）
 
 set -euo pipefail
 
@@ -54,7 +55,7 @@ SINGBOX_BIN="${PANEL_DIR}/bin/sing-box"
 GOST_REF="${GOST_REF:-master}"
 GO_VERSION="${GO_VERSION:-1.26.8}"
 # 发布前请把下面这行改成你自己的仓库地址（curl 一键安装时会从这里拉取源码）
-DEFAULT_PANEL_REPO="https://github.com/baiduxc/gost-webui"
+DEFAULT_PANEL_REPO="https://github.com/Aonggg/gost-webui"
 PANEL_REPO="${PANEL_REPO:-$DEFAULT_PANEL_REPO}"
 # 预编译包地址（可选，支持 {arch} 占位符；设置后优先使用，安装更快且无需编译）
 PANEL_RELEASE_URL="${PANEL_RELEASE_URL:-}"
@@ -62,6 +63,7 @@ PANEL_RELEASE_URL="${PANEL_RELEASE_URL:-}"
 GOST_BIN_SRC="${GOST_BIN_URL:-}"
 PANEL_BIN_SRC="${PANEL_BIN_URL:-}"
 ORG_NAME="GOST 面板"
+TIMEZONE="${TIMEZONE-Asia/Shanghai}"
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; RESET=$'\033[0m'
 info() { echo -e "${BLUE}[*]${RESET} $*"; }
@@ -92,14 +94,14 @@ if command -v apt-get >/dev/null 2>&1; then
   pkg_install() { DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null; }
   info "安装基础依赖 (apt)…"
   apt-get update -qq >/dev/null 2>&1 || true
-  pkg_install ca-certificates curl git tar iproute2 || true
+  pkg_install ca-certificates curl git tar iproute2 tzdata || true
 elif command -v yum >/dev/null 2>&1; then
   pkg_install() { yum install -y -q "$@" >/dev/null; }
   info "安装基础依赖 (yum)…"
-  pkg_install ca-certificates curl git tar iproute || true
+  pkg_install ca-certificates curl git tar iproute tzdata || true
 elif command -v apk >/dev/null 2>&1; then
   pkg_install() { apk add --no-cache "$@" >/dev/null; }
-  pkg_install ca-certificates curl git tar iproute2 || true
+  pkg_install ca-certificates curl git tar iproute2 tzdata || true
 else
   warn "未识别的包管理器，假定 curl/git/tar 已安装"
 fi
@@ -170,6 +172,20 @@ detect_public_ip() {
 # 本机第一个非回环 IP（内网地址）
 detect_local_ip() {
   hostname -I 2>/dev/null | tr ' ' '\n' | grep -vE '^(127\.|::1$|$)' | head -1 || true
+}
+
+# 校准系统时间：时钟漂移会让依赖时间戳/证书的协议握手失败（节点"突然没网"），也会影响面板的到期/配额判定。
+# 逻辑在面板二进制里（gost-webui -timesync）：复用已装的 chrony/ntpd/timesyncd，一个都没有就装；
+# NTP 被封则按 HTTPS 站点时间校正；同时把系统时区设为 TIMEZONE（默认 Asia/Shanghai，--timezone "" 可跳过）。
+ensure_time_sync() {
+  local bin="$PANEL_DIR/bin/gost-webui"
+  [ -x "$bin" ] || { warn "面板二进制不存在，跳过时间校准"; return 0; }
+  info "校准系统时间（NTP / 时区 ${TIMEZONE:-不改}）…"
+  if "$bin" -timesync -timezone "${TIMEZONE}"; then
+    ok "系统时间已校准；面板运行期间会持续守护（未同步自动修复）"
+  else
+    warn "系统时间暂未能校准（可稍后在面板「系统设置 → 时间同步」或 go-ui 菜单重试）"
+  fi
 }
 
 # 放行本机防火墙端口
@@ -467,6 +483,7 @@ parse_args() {
       --gost-bin|--gost-bin-url) GOST_BIN_SRC="${2:-}"; shift 2 2>/dev/null || shift ;;
       --panel-bin|--panel-bin-url) PANEL_BIN_SRC="${2:-}"; shift 2 2>/dev/null || shift ;;
       --gh-proxy) GH_PROXY="${2:-}"; shift 2 2>/dev/null || shift ;;
+      --timezone) TIMEZONE="${2-}"; shift 2 2>/dev/null || shift ;;
       --uninstall) uninstall_all; exit 0 ;;
       -h|--help) usage; exit 0 ;;
       *) shift ;;
@@ -481,6 +498,32 @@ parse_args() {
   if [ -n "$BASE_PATH" ]; then
     NORM_BASE="/${BASE_PATH#/}"
     NORM_BASE="${NORM_BASE%/}"
+  fi
+  # 时区名要能在 zoneinfo 里找到：写错会让 Go 静默退回 UTC（每日配额在 UTC 0 点重置），带空格会把
+  # systemd 的 Environment= 行拆成两段
+  if [ -n "$TIMEZONE" ]; then
+    case "$TIMEZONE" in
+      *[[:space:]]*|*..*|/*) die "时区名无效: $TIMEZONE（示例：Asia/Shanghai；--timezone \"\" 表示不改）" ;;
+    esac
+    [ -f "/usr/share/zoneinfo/$TIMEZONE" ] || die "时区不存在: $TIMEZONE（示例：Asia/Shanghai；--timezone \"\" 表示不改）"
+  fi
+}
+
+# 下载前先看一眼系统时钟：偏差大到证书验不过时，所有 HTTPS 下载（Go / gost / sing-box / git）都会失败，
+# 而正式的校时逻辑在面板二进制里、要等编译完才有。这里用能验证书的站点 Date 头粗调一次（偏差 > 1 天才动）。
+preflight_clock() {
+  curl -fsS -m 8 -o /dev/null https://www.cloudflare.com/ 2>/dev/null && return 0
+  local hdr remote now diff
+  hdr="$(curl -sIk -m 8 https://www.cloudflare.com/ 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="date"{print $2; exit}')"
+  [ -n "$hdr" ] || return 0
+  remote="$(date -d "$hdr" +%s 2>/dev/null || true)"
+  [ -n "$remote" ] || return 0
+  now="$(date +%s)"
+  diff=$(( now > remote ? now - remote : remote - now ))
+  if [ "$diff" -gt 86400 ]; then
+    warn "系统时钟偏差约 $((diff / 86400)) 天，先按互联网时间粗调（安装完成后面板会用 NTP 精确校准）"
+    date -s "@$remote" >/dev/null 2>&1 || true
+    command -v hwclock >/dev/null 2>&1 && hwclock --systohc >/dev/null 2>&1 || true
   fi
 }
 
@@ -562,6 +605,8 @@ write_config() {
     return
   fi
   PANEL_USER="${PANEL_USER_IN:-admin}"
+  # 写进 YAML 双引号串前转义 \ 和 "（用户自定义密码里可能带这些字符）
+  yaml_q() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
   local api_port
   api_port="$(pick_free_port)"
   if [ -n "${PANEL_PASS_IN:-}" ]; then
@@ -587,8 +632,8 @@ sample_seconds: 15
 retention_days: 90
 
 admin:
-  username: "${PANEL_USER}"
-  password: "${PANEL_PASS}"
+  username: "$(yaml_q "$PANEL_USER")"
+  password: "$(yaml_q "$PANEL_PASS")"
 
 # VLESS+REALITY 引擎（可选；二进制存在即启用）
 singbox:
@@ -763,6 +808,16 @@ show_logs() {
   pause
 }
 
+time_sync() {
+  clear; header "时间同步检查 / 校时"
+  command -v timedatectl >/dev/null 2>&1 && timedatectl 2>/dev/null | sed 's/^/  /' | grep -E 'Local time|Time zone|synchronized|NTP service'
+  line
+  local tz
+  tz="$(command -v timedatectl >/dev/null 2>&1 && timedatectl show -p Timezone --value 2>/dev/null || true)"
+  if "$BIN" -timesync -timezone "${tz:-}"; then ok "校时完成"; else err "校时未成功，请查看上方说明"; fi
+  pause
+}
+
 do_uninstall() {
   clear; header "干净卸载"
   warn "将删除：systemd 服务、程序 ${PANEL_DIR}、配置 ${CONF_DIR}"
@@ -774,7 +829,11 @@ do_uninstall() {
   rm -f "$UNIT"; systemctl daemon-reload >/dev/null 2>&1 || true
   pkill -f "$PANEL_DIR/bin/gost-webui" >/dev/null 2>&1 || true
   pkill -f "$PANEL_DIR/bin/gost -C" >/dev/null 2>&1 || true
+  pkill -f "$PANEL_DIR/bin/sing-box" >/dev/null 2>&1 || true
   sleep 1
+  # 收回面板运行期间自动放行的节点/订阅端口（记录在数据库里，只有面板自己知道）
+  [ -x "$PANEL_DIR/bin/gost-webui" ] && "$PANEL_DIR/bin/gost-webui" -c "$CONF" -fw-release 2>/dev/null || true
+  rm -f /etc/systemd/timesyncd.conf.d/gost-webui.conf
   if [ -f "$PANEL_DIR/uninstall.sh" ]; then
     KEEP_DATA="$([ "${keep,,}" = "y" ] && echo 1 || echo 0)" bash "$PANEL_DIR/uninstall.sh" >/dev/null 2>&1 || true
   fi
@@ -816,9 +875,10 @@ menu() {
   printf '  6) 重启面板 / gost\n'
   printf '  7) 查看日志\n'
   printf '  8) 干净卸载\n'
+  printf '  9) 时间同步检查 / 校时\n'
   printf '  0) 退出\n'
   line
-  read -rp "请选择 [0-8]: " c || exit 0
+  read -rp "请选择 [0-9]: " c || exit 0
   case "$c" in
     1) show_status; menu ;;
     2) change_account; menu ;;
@@ -828,6 +888,7 @@ menu() {
     6) do_restart; menu ;;
     7) show_logs; menu ;;
     8) do_uninstall ;;
+    9) time_sync; menu ;;
     0|q|"") echo "再见"; exit 0 ;;
     *) menu ;;
   esac
@@ -843,6 +904,7 @@ case "${1:-}" in
   path)    change_path ;;
   restart) restart_svc ;;
   logs)    show_logs ;;
+  timesync) time_sync ;;
   uninstall) do_uninstall ;;
   *)       menu ;;
 esac
@@ -875,6 +937,7 @@ RestartSec=3
 LimitNOFILE=1048576
 KillMode=control-group
 TimeoutStopSec=15
+$( [ -n "$TIMEZONE" ] && printf '# 面板/gost/sing-box 统一按该时区：每日配额在当地 0 点重置，日志与通知时间可读\nEnvironment=TZ=%s\n' "$TIMEZONE" )
 
 [Install]
 WantedBy=multi-user.target
@@ -939,9 +1002,13 @@ uninstall_all() {
   fi
   pkill -f "${PANEL_DIR}/bin/gost-webui" >/dev/null 2>&1 || true
   pkill -f "${PANEL_DIR}/bin/gost" >/dev/null 2>&1 || true
+  pkill -f "${PANEL_DIR}/bin/sing-box" >/dev/null 2>&1 || true
   sleep 1
   # go-ui 管理命令一并移除（旧版 --uninstall 漏删，属卸载不干净 BUG）
   rm -f /usr/local/bin/go-ui
+  # 收回面板运行期间自动放行的节点/订阅端口（记录在数据库里，只有面板自己知道）
+  [ -x "$PANEL_DIR/bin/gost-webui" ] && "$PANEL_DIR/bin/gost-webui" -c "$CONF_DIR/panel.yml" -fw-release 2>/dev/null || true
+  rm -f /etc/systemd/timesyncd.conf.d/gost-webui.conf
   # 撤销安装时本机放行的端口规则（ufw / firewalld / iptables）
   close_firewall_port "$PANEL_PORT" || true
   rm -rf "$PANEL_DIR"
@@ -960,10 +1027,12 @@ main() {
   echo
   echo "===================== ${ORG_NAME} 安装程序 ====================="
   interactive_config
+  preflight_clock
   install_gost
   install_singbox
   install_panel
   write_config
+  ensure_time_sync
   install_systemd
   install_goui
   check_listen_port

@@ -128,6 +128,45 @@ function fmtTime(ts) {
   const p = x => String(x).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
+/* 到期时间统一按北京时间（UTC+8）录入与展示，与浏览器时区无关 */
+const BJ_OFFSET = 8 * 3600;
+function fmtBeijing(ts) {
+  if (!ts) return '—';
+  const d = new Date((ts + BJ_OFFSET) * 1000);
+  const p = x => String(x).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+// datetime-local 的 value（YYYY-MM-DDTHH:mm）↔ Unix 秒，按北京时间解释
+function beijingInputValue(ts) { return ts ? fmtBeijing(ts).replace(' ', 'T') : ''; }
+function parseBeijingInput(v) {
+  v = (v || '').trim();
+  if (!v) return 0;
+  const t = Date.parse((v.length === 16 ? v + ':00' : v) + '+08:00');
+  return isNaN(t) ? NaN : Math.floor(t / 1000);
+}
+function nodeExpired(n) { return !!(n && n.expireAt && n.expireAt * 1000 <= Date.now()); }
+// 节点表/详情里的到期说明：已到期红标；未到期显示到期日
+function expiryNote(n) {
+  if (!n || !n.expireAt) return '';
+  if (nodeExpired(n)) return '<span class="status-inline"><span class="status-dot bad"></span>已到期</span>';
+  const left = n.expireAt - Math.floor(Date.now() / 1000);
+  const soon = left < 3 * 86400;
+  return `<span class="${soon ? 'error-text' : 'tertiary'}" style="font-size:12px">${fmtBeijing(n.expireAt)} 到期</span>`;
+}
+// upstreamNote 本机入站节点的出口代理说明（列表/详情）
+function upstreamNote(n) {
+  const u = n && n.upstream;
+  if (!u || !u.host) return '';
+  return ` → 出口 ${esc(u.type || 'socks5')}://${esc(u.host)}:${u.port}`;
+}
+// upstreamBody 读取「出口代理」表单 → 请求体；地址留空表示不用（清除）
+function upstreamBody() {
+  return {
+    type: $('#f-up-type').value, host: $('#f-up-host').value.trim(),
+    port: parseInt($('#f-up-port').value || '0', 10) || 0,
+    user: $('#f-up-user').value.trim(), pass: $('#f-up-pass').value,
+  };
+}
 function fmtDay(ts) {
   const d = new Date(ts * 1000);
   return `${d.getMonth() + 1}/${d.getDate()}`;
@@ -323,14 +362,47 @@ function renderStatusBar() {
   const bs = $('#brandSub'); if (bs) bs.textContent = `/ ${state.nodes.length} 节点`;
 }
 
+// clockFixing：校时进行中（1–4 分钟）。banner 每 5 秒随 refreshAll 重绘，按钮状态必须从这里恢复，
+// 否则刚点过的按钮会被一个全新的可点按钮替换掉。
+let clockFixing = false;
 function renderHostWarn() {
-  const html = state.publicHostPrivate ? `<div class="notice warn">
+  let html = state.publicHostPrivate ? `<div class="notice warn">
     当前服务器地址 <b>${esc(state.publicHost)}</b> 是内网地址，外部客户端无法连接。
     请到「系统设置 → 服务器地址」填写公网 IP 或域名。</div>` : '';
+  if (state.overview && state.overview.timeState === 'unsynced') {
+    html += `<div class="notice warn">服务器<b>系统时间未同步</b>，面板正在自动尝试启用 NTP / HTTP 校时。时钟不准会让 VMess / SS2022 / 带时间校验的 REALITY 等协议握手失败、节点「突然没网」，也会影响到期与配额判定。
+      <button class="btn secondary sm fix-clock-btn" style="margin-left:10px"${clockFixing ? ' disabled' : ''}>${clockFixing ? '校时中…' : '立即校时'}</button>
+      <button class="btn ghost sm goto-system-btn" style="margin-left:6px">查看详情</button></div>`;
+  }
   ['#hostWarn', '#hostWarnOverview'].forEach(sel => {
     const el = $(sel);
     if (el) el.innerHTML = html;
   });
+  $$('.fix-clock-btn').forEach(btn => { btn.onclick = () => fixClock(btn, '立即校时'); });
+  $$('.goto-system-btn').forEach(btn => { btn.onclick = () => setView('system'); });
+}
+
+// fixClock 触发一次完整校时（启用/安装 NTP → 等待校准 → HTTP 兜底），耗时可能到 1 分钟以上
+async function fixClock(btn, label) {
+  if (clockFixing) return;
+  clockFixing = true;
+  btn.disabled = true;
+  btn.textContent = '校时中…';
+  try {
+    const r = await api('api/system/time-sync', { method: 'POST' });
+    toast((r.detail || '已完成校时').split('\n').pop());
+    clockFixing = false;
+    await refreshAll();
+    if (state.view === 'system') await loadSystem();
+  } catch (e) {
+    toast(e.message.split('\n')[0], 'err');
+    clockFixing = false;
+    if (state.view === 'system') await loadSystem();
+  } finally {
+    clockFixing = false;
+    // 按钮可能已被重绘替换；仍在文档里才需要恢复
+    if (btn.isConnected) { btn.disabled = false; btn.textContent = label; }
+  }
 }
 
 /* ---------------- 概览 ---------------- */
@@ -339,7 +411,7 @@ function renderOverview() {
   if (!ov) return;
   const n = ov.nodes || {}, t = ov.today || {}, m = ov.month || {}, all = ov.total || {};
   $('#statCards').innerHTML = `
-    ${metricCard('节点', `${n.enabled || 0}<small> / ${n.total || 0}</small>`, n.blocked ? `${n.blocked} 个已超限暂停` : '全部正常')}
+    ${metricCard('节点', `${n.enabled || 0}<small> / ${n.total || 0}</small>`, [n.blocked ? `${n.blocked} 个已超限暂停` : '', n.expired ? `${n.expired} 个已到期` : ''].filter(Boolean).join(' · ') || '全部正常')}
     ${metricCard('当前连接', String(n.currentConns || 0), `累计连接 ${n.totalConns || 0}`)}
     ${metricCard('今日流量', fmtBytes((t.in || 0) + (t.out || 0)), `上行 ${fmtBytes(t.in)} · 下行 ${fmtBytes(t.out)}`)}
     ${metricCard('本月流量', fmtBytes((m.in || 0) + (m.out || 0)), `上行 ${fmtBytes(m.in)} · 下行 ${fmtBytes(m.out)}`)}`;
@@ -362,7 +434,7 @@ function renderOverview() {
         const pct = Math.max(0, Math.round(sum / max * 100));
         return `<tr>
           <td>${esc(x.name)}</td>
-          <td>${x.enabled ? (x.blocked ? '<span class="status-inline"><span class="status-dot bad"></span>超限暂停</span>' : '<span class="status-inline"><span class="status-dot ok"></span>运行中</span>') : '<span class="status-inline"><span class="status-dot"></span>已停用</span>'}</td>
+          <td>${x.enabled ? (x.expired ? '<span class="status-inline"><span class="status-dot bad"></span>已到期</span>' : x.blocked ? '<span class="status-inline"><span class="status-dot bad"></span>超限暂停</span>' : '<span class="status-inline"><span class="status-dot ok"></span>运行中</span>') : '<span class="status-inline"><span class="status-dot"></span>已停用</span>'}</td>
           <td><div class="meter"><i style="width:${pct}%"></i></div></td>
           <td class="right mono">${fmtBytes(sum)}</td></tr>`;
       }).join('')}</tbody></table></div>`;
@@ -393,15 +465,18 @@ function renderHostCards(met) {
   }).join('');
 }
 
-function statusTag(enabled, blocked) {
-  // 常态不显示文字（开关本身即状态）；仅超限暂停时提示
+function statusTag(enabled, blocked, expired) {
+  // 常态不显示文字（开关本身即状态）；仅到期/超限暂停时提示
+  if (enabled && expired) return '<span class="status-inline"><span class="status-dot bad"></span>已到期</span>';
   if (enabled && blocked) return '<span class="status-inline"><span class="status-dot bad"></span>超限暂停</span>';
   return '';
 }
-/* 节点表专用：开关 + 异常徽标 */
+/* 节点表专用：开关 + 异常徽标 / 到期日 */
 function nodeStatusCell(n) {
   const blocked = n.live && n.live.quotaBlocked;
-  const badge = (n.enabled && blocked) ? '<span class="status-inline"><span class="status-dot bad"></span>超限暂停</span>' : '';
+  const badge = nodeExpired(n) ? expiryNote(n)
+    : (n.enabled && blocked) ? '<span class="status-inline"><span class="status-dot bad"></span>超限暂停</span>'
+    : expiryNote(n);
   return `<button class="node-toggle" data-act="toggle" data-id="${esc(n.id)}" role="switch" aria-checked="${!!n.enabled}" aria-label="${n.enabled ? '停用' : '启用'}${esc(n.name)}"><span class="toggle-track"></span></button>${badge}`;
 }
 
@@ -615,7 +690,7 @@ function renderNodes() {
   closeAllDropdowns();
   const wrap = $('#nodeTable');
   const nodes = state.nodes;
-  const active = nodes.filter(n => n.enabled && !(n.live && n.live.quotaBlocked)).length;
+  const active = nodes.filter(n => n.enabled && !nodeExpired(n) && !(n.live && n.live.quotaBlocked)).length;
   $('#nodesSummary').textContent = `${nodes.length} 个节点 · ${active} 个已启用 · 本月 ${fmtBytes(nodes.reduce((sum, n) => sum + (n.monthIn || 0) + (n.monthOut || 0), 0))}`;
   if (!nodes.length) {
     wrap.innerHTML = '<div class="empty"><span class="empty-title">暂无节点</span><p>添加第一个节点，开始中转。</p><button class="btn secondary" data-act="add">添加节点</button></div>';
@@ -624,7 +699,7 @@ function renderNodes() {
   wrap.innerHTML = `<table>
     <thead><tr><th>节点名称 / 落地机</th><th>监听端口</th><th>本月用量 / 配额</th><th>状态</th><th class="right">操作</th></tr></thead>
     <tbody>${nodes.map(n => `<tr>
-      <td><button class="node-select" data-act="detail" data-id="${esc(n.id)}" aria-label="查看${esc(n.name)}详情">${icon('server')}<span><b>${esc(n.name)}</b><small>${esc(n.protocol || 'TCP')}${n.mode === 'gost' ? ' · GOST' : ''}${n.udp ? ' · TCP+UDP' : ''} / ${n.mode === 'reality' ? '本机 sing-box' : (n.mode === 'gost' && n.gostLocal ? '本机落地' : `${esc(n.targetHost)}:${n.targetPort}`)}</small></span></button></td>
+      <td><button class="node-select" data-act="detail" data-id="${esc(n.id)}" aria-label="查看${esc(n.name)}详情">${icon('server')}<span><b>${esc(n.name)}</b><small>${esc(n.protocol || 'TCP')}${n.mode === 'gost' ? ' · GOST' : ''}${n.udp ? ' · TCP+UDP' : ''} / ${n.mode === 'reality' ? '本机 sing-box' : (n.mode === 'gost' && n.gostLocal ? '本机落地' : `${esc(n.targetHost)}:${n.targetPort}`)}${upstreamNote(n)}</small></span></button></td>
       <td class="mono">${n.listenPort}</td>
       <td class="node-quota"><span class="mono">${fmtBytes((n.monthIn || 0) + (n.monthOut || 0))}</span>${quotaCell(n)}</td>
       <td class="node-status-cell">${nodeStatusCell(n)}</td>
@@ -632,8 +707,9 @@ function renderNodes() {
         <button class="btn ghost sm dropdown-toggle" data-act="menu" data-id="${esc(n.id)}" aria-label="${esc(n.name)}的操作" aria-expanded="false">操作${icon('chevron', 'sm')}</button>
         <div class="dropdown-menu">
           <button data-act="copy" data-id="${esc(n.id)}">${icon('copy')}复制链接</button>
+          <button data-act="qr" data-id="${esc(n.id)}">${icon('qr')}二维码</button>
           <button data-act="sub" data-id="${esc(n.id)}">${icon('rss')}订阅</button>
-          <button data-act="detail" data-id="${esc(n.id)}">${icon('qr')}详情</button>
+          <button data-act="detail" data-id="${esc(n.id)}">${icon('info')}详情</button>
           <button data-act="edit" data-id="${esc(n.id)}">${icon('edit')}编辑</button>
           <button data-act="toggle" data-id="${esc(n.id)}">${icon('power')}${n.enabled ? '停用' : '启用'}</button>
           <button data-act="del" data-id="${esc(n.id)}" class="danger">${icon('trash')}删除</button>
@@ -701,6 +777,7 @@ async function nodeTableClick(e) {
     }
     case 'detail': openDetail(node); break;
     case 'sub': openNodeSub(node); break;
+    case 'qr': openQRModal(node); break;
     case 'edit': openNodeForm(node); break;
     case 'toggle':
       try {
@@ -839,7 +916,7 @@ async function openAboutModal() {
       <div class="k">主机运行</div><div class="v">${fmtDuration(met.hostUptime)}</div>
       <div class="k">配置文件</div><div class="v mono">${esc(p.configFile || '')}</div>
       <div class="k">面板账号</div><div class="v mono">${esc(st.username || 'admin')}</div>
-      <div class="k">项目地址</div><div class="v"><a href="https://github.com/baiduxc/Gost-webui" target="_blank" rel="noopener noreferrer">github.com/baiduxc/Gost-webui</a></div>`;
+      <div class="k">项目地址</div><div class="v"><a href="https://github.com/Aonggg/gost-webui" target="_blank" rel="noopener noreferrer">github.com/Aonggg/gost-webui</a></div>`;
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -906,7 +983,14 @@ async function openNodeForm(node) {
   const rate = (node && node.rate) || { enabled: false, inBps: 0, outBps: 0 };
   const isGost = !!(node && node.mode === 'gost');
   const isReality = !!(node && node.mode === 'reality');
-  const initMode = isReality ? 'reality' : (isGost ? 'gost' : 'link');
+  // 粘贴链接模式下，落地是 http/socks5 代理的节点用「填写地址」表单编辑
+  const landing = (node && node.landing) || null;
+  const isProxy = !!(node && node.mode === 'link' && landing && ['http', 'https', 'socks', 'socks5', 'socks5h'].includes(landing.scheme));
+  const initMode = isReality ? 'reality' : (isGost ? 'gost' : (isProxy ? 'proxy' : 'link'));
+  const px = isProxy ? { type: landing.scheme.startsWith('socks') ? 'socks5' : landing.scheme, host: landing.host, port: landing.port, user: landing.user || '' } : { type: 'socks5', host: '', port: '', user: '' };
+  const up = (node && node.upstream) || { type: 'socks5', host: '', port: '', user: '' };
+  const sbTransport = (isReality && node && node.realityTransport) || '';
+  const sbAccel = sbTransport !== '' && sbTransport !== 'reality';
   const rv = (v) => esc(isReality && node ? (node[v] || '') : '');
   const gp = (isGost && node.gostProtocol) || 'ss';
   const gt = (isGost && node.gostTransport) || gostProtocol(gp).transport;
@@ -922,15 +1006,42 @@ async function openNodeForm(node) {
 
     <div class="tabs" id="nodeModeTabs" style="margin-bottom:16px">
       <button type="button" data-mode="link" class="${initMode === 'link' ? 'active' : ''}">粘贴链接</button>
+      <button type="button" data-mode="proxy" class="${initMode === 'proxy' ? 'active' : ''}">HTTP / SOCKS5 代理</button>
       <button type="button" data-mode="gost" class="${initMode === 'gost' ? 'active' : ''}">GOST 体系</button>${state.realityAvailable || isReality ? `
       <button type="button" data-mode="reality" class="${initMode === 'reality' ? 'active' : ''}">VLESS + REALITY</button>` : ''}
     </div>
 
+    <div id="modeProxy" class="${initMode === 'proxy' ? '' : 'hidden'}">
+      <div class="notice warn"><b>注意：这是明文直通中转</b>——客户端到本机之间就是裸的 SOCKS5 / HTTP 协议。从中国大陆直连境外服务器时会被墙识别并阻断（握手后丢包、端口被封）。国内客户端请改用加密入口：客户端走 VLESS+REALITY 或 Shadowsocks 连本机，本机再经这台落地机出站。
+        <button class="btn secondary sm" id="switchEncryptedBtn" type="button" style="margin-left:8px">改用加密入口 →</button></div>
+      <div class="notice">把落地机的 HTTP / SOCKS5 代理填进来，本机开端口做 TCP 中转；客户端用同样的账号密码连接本机端口即可（SOCKS5 的 UDP 不经中转）。</div>
+      <div class="row">
+        <div class="field" style="flex:0 0 150px">
+          <label>代理类型</label>
+          <select id="f-proxy-type">
+            <option value="socks5" ${px.type === 'socks5' ? 'selected' : ''}>SOCKS5</option>
+            <option value="http" ${px.type === 'http' ? 'selected' : ''}>HTTP</option>
+            <option value="https" ${px.type === 'https' ? 'selected' : ''}>HTTPS（TLS）</option>
+          </select>
+        </div>
+        <div class="field"><label>落地机 IP / 域名</label><input id="f-proxy-host" type="text" value="${esc(px.host)}" placeholder="如 1.2.3.4"></div>
+        <div class="field" style="flex:0 0 130px"><label>端口</label><input id="f-proxy-port" type="number" min="1" max="65535" value="${px.port || ''}" placeholder="如 1080"></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>账号（无鉴权留空）</label><input id="f-proxy-user" type="text" value="${esc(px.user)}" autocomplete="off"></div>
+        <div class="field"><label>密码</label><input id="f-proxy-pass" type="password" autocomplete="new-password" placeholder="${isProxy ? '留空保持不变' : '无鉴权留空'}"></div>
+      </div>
+      <div class="btn-group" style="margin-top:4px">
+        <button class="btn secondary sm" id="testProxyBtn" type="button">测试落地机连通性</button>
+        <span class="hint" id="testProxyResult" style="margin:0"></span>
+      </div>
+    </div>
+
     <div id="modeLink" class="${initMode === 'link' ? '' : 'hidden'}">
     <div class="field">
-      <label>落地机 v2rayN 链接</label>
-      <textarea id="f-link" placeholder="粘贴 vmess:// / vless:// / trojan:// / ss:// / hysteria2:// / tuic:// 链接">${esc(!isGost && node ? node.landingLink : '')}</textarea>
-      <div class="hint">粘贴落地机节点的分享链接，面板自动解析协议、地址与鉴权参数</div>
+      <label>落地机链接</label>
+      <textarea id="f-link" placeholder="粘贴 vmess:// / vless:// / trojan:// / ss:// / hysteria2:// / tuic:// 链接，或落地机的 HTTP / SOCKS5 代理：http://用户:密码@IP:端口、socks5://用户:密码@IP:端口">${esc(!isGost && node ? node.landingLink : '')}</textarea>
+      <div class="hint">本机只做端口中转（TCP 四层透传），面板自动解析协议、地址与鉴权参数；落地机填 HTTP / SOCKS5 代理时客户端拿到的就是指向本机的 http:// / socks5:// 地址</div>
       <div class="btn-group" style="margin-top:12px">
         <button class="btn secondary sm" id="testBtn">测试落地机连通性</button>
         <span class="hint" id="testResult" style="margin:0"></span>
@@ -1008,26 +1119,54 @@ async function openNodeForm(node) {
     </div>
 
     <div id="modeReality" class="${initMode === 'reality' ? '' : 'hidden'}">
-      <div class="notice">REALITY 由本机 sing-box 进程承载：伪装成目标网站 TLS 握手，无证书、抗探测。监听端口即客户端连接端口。</div>
+      <div class="notice" id="realityIntro">REALITY 由本机 sing-box 进程承载：伪装成目标网站 TLS 握手，无证书、抗探测。监听端口即客户端连接端口。</div>
+      <div class="field">
+        <label class="switch"><input type="checkbox" id="f-accel" ${sbAccel ? 'checked' : ''}><span class="track"></span>
+          <span><span class="txt">支持被加速中转</span><span class="desc">开启后不用 REALITY（它的鉴权藏在 TLS 握手里，经过中转/加速设备改写就失效），改用能被加速透传的协议；关闭则还是默认的 VLESS + REALITY。</span></span></label>
+      </div>
+      <div id="accelBox" class="${sbAccel ? '' : 'hidden'}">
+        <div class="row">
+          <div class="field" style="flex:0 0 330px">
+            <label>加速协议</label>
+            <select id="f-sb-transport">
+              <option value="vmess" ${sbTransport === 'ws' || sbTransport === 'ws-tls' ? '' : 'selected'}>VMess + TCP（纯 TCP 端口转发类加速，推荐）</option>
+              <option value="ws-tls" ${sbTransport === 'ws-tls' ? 'selected' : ''}>VLESS + WebSocket + TLS（CDN / HTTPS 回源类加速）</option>
+              <option value="ws" ${sbTransport === 'ws' ? 'selected' : ''}>VLESS + WebSocket 明文（HTTP 回源类加速）</option>
+            </select>
+          </div>
+          <div class="field ws-only ${sbTransport === 'ws' || sbTransport === 'ws-tls' ? '' : 'hidden'}"><label>WebSocket 路径</label><input id="f-ws-path" type="text" value="${esc(isReality && node ? node.realityWsPath || '' : '')}" placeholder="留空自动生成，如 /a1b2c3"></div>
+        </div>
+        <div class="hint" id="accelHint" style="margin:-4px 0 12px"></div>
+        <div class="field">
+          <label>加速入口（可选）</label>
+          <input id="f-accel-host" type="text" value="${esc(isReality && node ? node.accelHost || '' : '')}" placeholder="如 a.example.com:30189 —— 填了就按入口地址生成客户端链接 / 二维码 / 订阅">
+          <div class="hint">加速侧把入口映射到本机 <b>监听端口</b>。链接、二维码、订阅会直接指向入口；直连本机的链接作为备用一并显示。</div>
+        </div>
+      </div>
+      <div id="realityBox" class="${sbAccel ? 'hidden' : ''}">
       <div class="field">
         <label>伪装域名（SNI / 握手目标）</label>
-        <input id="f-reality-sni" type="text" value="${rv('realitySni')}" placeholder="如 www.microsoft.com（必须支持 TLS1.3，客户端 SNI 与伪装目标一致）">
-        <div class="hint">建议使用大型站点（微软/苹果/亚马逊等），不要用被墙的域名</div>
+        <div class="row tight">
+          <input id="f-reality-sni" type="text" value="${rv('realitySni')}" placeholder="留空自动选择（微软 / 苹果 / 亚马逊等大型站点）">
+          <button class="btn secondary sm" id="realitySniBtn" type="button" style="flex:0 0 auto">随机</button>
+        </div>
+        <div class="hint">目标必须支持 TLS 1.3（推荐 H2）且未被墙；「随机」会从本机实际探测候选站点后挑选，客户端 SNI 与此一致</div>
+      </div>
       </div>
       <div class="row">
         <div class="field">
           <label>UUID</label>
           <div class="row tight">
-            <input id="f-reality-uuid" type="text" value="${rv('realityUuid')}" placeholder="点击右侧按钮生成">
+            <input id="f-reality-uuid" type="text" value="${rv('realityUuid')}" placeholder="${isReality ? '留空保留现有' : '点击右侧按钮生成'}">
             <button class="btn secondary sm" id="realityUuidBtn" type="button" style="flex:0 0 auto" title="仅生成 UUID">生成</button>
           </div>
         </div>
-        <div class="field">
+        <div class="field reality-only ${sbAccel ? 'hidden' : ''}">
           <label>Short ID</label>
           <input id="f-reality-sid" type="text" value="${rv('realityShortId')}" placeholder="8 位 hex">
         </div>
       </div>
-      <div class="field">
+      <div class="field reality-only ${sbAccel ? 'hidden' : ''}">
         <label>REALITY 密钥对</label>
         <input id="f-reality-pub" type="text" value="${rv('realityPub')}" placeholder="公钥（pbk，下发给客户端）" readonly>
         <input id="f-reality-priv" type="hidden" value="${rv('realityPriv')}">
@@ -1036,7 +1175,32 @@ async function openNodeForm(node) {
           <span class="hint" id="realityGenHint" style="margin:0">${isReality ? '编辑时留空表示保留现有凭据' : ''}</span>
         </div>
       </div>
-      <div class="hint" style="margin-top:4px">REALITY 节点支持流量统计与配额（超限自动停实例、恢复周期自动拉起）；限速与并发限制暂不支持。</div>
+      <div class="hint" style="margin-top:4px">sing-box 节点支持流量统计与配额（超限自动停实例、恢复周期自动拉起）；限速与并发限制暂不支持。</div>
+    </div>
+
+    <div id="upstreamSection" class="hidden">
+      <div class="section-label">出口代理（可选）</div>
+      <div class="hint" style="margin:-6px 0 10px">客户端到本机走上面的加密协议，本机再通过落地机的 SOCKS5 / HTTP 代理出站。国内客户端连境外的「明文 SOCKS5/HTTP 中转」会被墙阻断，用这种方式才稳。留空 = 本机直出。</div>
+      <div class="row">
+        <div class="field" style="flex:0 0 150px">
+          <label>类型</label>
+          <select id="f-up-type">
+            <option value="socks5" ${up.type === 'socks5' ? 'selected' : ''}>SOCKS5</option>
+            <option value="http" ${up.type === 'http' ? 'selected' : ''}>HTTP</option>
+            <option value="https" ${up.type === 'https' ? 'selected' : ''}>HTTPS（TLS）</option>
+          </select>
+        </div>
+        <div class="field"><label>落地机 IP / 域名</label><input id="f-up-host" type="text" value="${esc(up.host)}" placeholder="留空则本机直出"></div>
+        <div class="field" style="flex:0 0 130px"><label>端口</label><input id="f-up-port" type="number" min="1" max="65535" value="${up.port || ''}" placeholder="如 1080"></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>账号（无鉴权留空）</label><input id="f-up-user" type="text" value="${esc(up.user)}" autocomplete="off"></div>
+        <div class="field"><label>密码</label><input id="f-up-pass" type="password" autocomplete="new-password" placeholder="${up.host && up.user ? '留空保持不变' : '无鉴权留空'}"></div>
+      </div>
+      <div class="btn-group" style="margin-top:4px">
+        <button class="btn secondary sm" id="testUpBtn" type="button">测试落地机连通性</button>
+        <span class="hint" id="testUpResult" style="margin:0"></span>
+      </div>
     </div>
 
     <div class="row">
@@ -1065,6 +1229,16 @@ async function openNodeForm(node) {
         <div class="field"><label>Host 覆盖</label><input id="f-host" type="text" value="${esc(node ? node.host || '' : '')}" placeholder="留空自动"></div>
       </div>
     </details>
+
+    <div class="section-label">有效期</div>
+    <div class="field">
+      <label>到期时间（北京时间）</label>
+      <div class="row tight">
+        <input id="f-expire" type="datetime-local" value="${beijingInputValue(node ? node.expireAt : 0)}">
+        <button class="btn secondary sm" id="clearExpireBtn" style="flex:0 0 auto">清除</button>
+      </div>
+      <span class="hint">留空永不到期；到期后节点自动停止服务（订阅中也不再出现），把时间改到将来即可恢复</span>
+    </div>
 
     <div class="section-label">流量限制</div>
     <div class="field">
@@ -1160,6 +1334,8 @@ async function openNodeForm(node) {
   };
   const updateModeUI = () => {
     const mode = $('#nodeModeTabs button.active')?.dataset.mode || 'link';
+    const upstreamOn = mode === 'reality' || (mode === 'gost' && $('#f-gost-location').value === 'local');
+    $('#upstreamSection').classList.toggle('hidden', !upstreamOn);
     if (mode === 'reality') {
       $('#udpField').classList.add('hidden');
       $('#rateConnSection').classList.add('hidden');
@@ -1168,12 +1344,39 @@ async function openNodeForm(node) {
     $('#rateConnSection').classList.remove('hidden');
     if (mode === 'gost') {
       updateGostFields(false);
+      if (upstreamOn && $('#f-up-host').value.trim()) $('#udpField').classList.add('hidden'); // 出口代理只走 TCP
+    } else if (mode === 'proxy') {
+      $('#udpField').classList.add('hidden'); // SOCKS5/HTTP 落地只做 TCP 中转
     } else {
-      $('#udpField').classList.remove('hidden');
       $('#udpField').classList.remove('hidden');
       $('#udpTitle').textContent = '同时转发 UDP';
       $('#udpDesc').textContent = 'hysteria2 / tuic / KCP / QUIC 等协议必须开启';
     }
+  };
+  $('#f-up-host').addEventListener('input', updateModeUI);
+  $('#testUpBtn').onclick = async () => {
+    const el = $('#testUpResult');
+    const u = upstreamBody();
+    if (!u.host || !(u.port > 0 && u.port < 65536)) { el.textContent = '请先填写落地机地址与端口'; el.className = 'hint error-text'; return; }
+    el.textContent = '测试中…'; el.className = 'hint';
+    try {
+      const r = await api('api/test-connect', { method: 'POST', body: { host: u.host, port: u.port } });
+      el.textContent = r.ok ? `落地机可达，延迟 ${r.latencyMs} ms` : `不可达：${r.error}`;
+      el.className = r.ok ? 'hint' : 'hint error-text';
+    } catch (e) { el.textContent = e.message; el.className = 'hint error-text'; }
+  };
+  // 明文中转页 → 加密入口：把落地代理搬到「出口代理」，切到 REALITY（没装 sing-box 则 GOST 本机 SS）
+  $('#switchEncryptedBtn').onclick = () => {
+    $('#f-up-type').value = $('#f-proxy-type').value;
+    $('#f-up-host').value = $('#f-proxy-host').value.trim();
+    $('#f-up-port').value = $('#f-proxy-port').value;
+    $('#f-up-user').value = $('#f-proxy-user').value.trim();
+    $('#f-up-pass').value = $('#f-proxy-pass').value;
+    const target = $('#nodeModeTabs button[data-mode="reality"]') || $('#nodeModeTabs button[data-mode="gost"]');
+    if (!$('#nodeModeTabs button[data-mode="reality"]')) { $('#f-gost-location').value = 'local'; }
+    target.click();
+    toast(target.dataset.mode === 'reality' ? '已切到 VLESS+REALITY，生成凭据后保存即可' : '已切到 GOST 本机落地（Shadowsocks），填好密码保存即可');
+    $('#upstreamSection').scrollIntoView({ behavior: 'smooth', block: 'center' });
   };
   $$('#nodeModeTabs button').forEach(b => {
     b.onclick = () => {
@@ -1182,11 +1385,24 @@ async function openNodeForm(node) {
       const isLink = mode === 'link';
       $('#modeLink').classList.toggle('hidden', !isLink);
       $('#advOverride').classList.toggle('hidden', !isLink);
+      $('#modeProxy').classList.toggle('hidden', mode !== 'proxy');
       $('#modeGost').classList.toggle('hidden', mode !== 'gost');
       const mr = $('#modeReality'); if (mr) mr.classList.toggle('hidden', mode !== 'reality');
       updateModeUI();
     };
   });
+  $('#testProxyBtn').onclick = async () => {
+    const el = $('#testProxyResult');
+    const host = $('#f-proxy-host').value.trim();
+    const port = parseInt($('#f-proxy-port').value || '0', 10);
+    if (!host || !(port > 0 && port < 65536)) { el.textContent = '请先填写落地机地址与端口'; el.className = 'hint error-text'; return; }
+    el.textContent = '测试中…'; el.className = 'hint';
+    try {
+      const r = await api('api/test-connect', { method: 'POST', body: { host, port } });
+      el.textContent = r.ok ? `落地机可达，延迟 ${r.latencyMs} ms` : `不可达：${r.error}`;
+      el.className = r.ok ? 'hint' : 'hint error-text';
+    } catch (e) { el.textContent = e.message; el.className = 'hint error-text'; }
+  };
   const ru = $('#realityUuidBtn');
   if (ru) ru.onclick = async () => {
     try {
@@ -1206,7 +1422,38 @@ async function openNodeForm(node) {
       $('#realityGenHint').textContent = '已生成，保存前请勿再次点击（会更换全部凭据）';
     } catch (e) { toast(e.message, 'err'); }
   };
-  $('#f-gost-location').onchange = () => updateGostFields(false);
+  const accelHints = {
+    vmess: 'VMess + TCP、无 TLS：首包是 VMess 加密头，不含 HTTP Host / TLS SNI——纯 TCP 端口转发类加速（含国内云入口，域名未备案也不受拦截）可直接透传。加速侧映射：入口 → 本机监听端口。',
+    'ws-tls': 'VLESS + WebSocket，源站自签 TLS：给 CDN / HTTPS 回源类加速用（回源到本机监听端口，HTTPS 回源且不校验证书）。入口域名在国内云上需已备案。',
+    ws: 'VLESS + WebSocket 明文：给只支持 HTTP 回源的加速用。入口域名在国内云上需已备案。',
+  };
+  const updateAccelUI = () => {
+    const on = $('#f-accel').checked;
+    const tr = $('#f-sb-transport').value;
+    $('#accelBox').classList.toggle('hidden', !on);
+    $('#realityBox').classList.toggle('hidden', on);
+    $$('#modeReality .reality-only').forEach(el => el.classList.toggle('hidden', on));
+    $$('#accelBox .ws-only').forEach(el => el.classList.toggle('hidden', tr === 'vmess'));
+    $('#accelHint').textContent = accelHints[tr] || '';
+    $('#realityIntro').textContent = on
+      ? '加速兼容模式：本机 sing-box 以可被中转透传的协议提供服务，客户端可直连本机，也可经加速入口连接。'
+      : 'REALITY 由本机 sing-box 进程承载：伪装成目标网站 TLS 握手，无证书、抗探测。监听端口即客户端连接端口。';
+  };
+  const fa = $('#f-accel');
+  if (fa) { fa.onchange = updateAccelUI; $('#f-sb-transport').onchange = updateAccelUI; updateAccelUI(); }
+  const rs = $('#realitySniBtn');
+  if (rs) rs.onclick = async () => {
+    rs.disabled = true;
+    rs.textContent = '探测中…';
+    try {
+      const r = await api('api/reality/sni');
+      $('#f-reality-sni').value = r.sni;
+      const ok = (r.probes || []).filter(p => p.ok).length;
+      toast(`已选择 ${r.sni}（本机可达 ${ok}/${(r.probes || []).length} 个候选）`);
+    } catch (e) { toast(e.message, 'err'); }
+    finally { rs.disabled = false; rs.textContent = '随机'; }
+  };
+  $('#f-gost-location').onchange = () => updateModeUI();
   $('#f-gost-protocol').onchange = () => updateGostFields(true);
   $('#f-gost-transport').onchange = () => updateGostFields(false);
   $('#gostSSRandBtn').onclick = () => { $('#f-gost-ss-pass').value = randPass(20); };
@@ -1217,6 +1464,7 @@ async function openNodeForm(node) {
   };
   $('#f-quota').onchange = e => $('#quotaBox').classList.toggle('hidden', !e.target.checked);
   $('#f-rate').onchange = e => $('#rateBox').classList.toggle('hidden', !e.target.checked);
+  $('#clearExpireBtn').onclick = () => { $('#f-expire').value = ''; };
   $('#testBtn').onclick = async () => {
     const el = $('#testResult');
     const info = state.lastParsed && state.lastParsed.raw === $('#f-link').value.trim()
@@ -1257,7 +1505,7 @@ async function parseLink(autofill) {
     const info = await api('api/parse', { method: 'POST', body: { link } });
     state.lastParsed = info;
     box.innerHTML = `<div class="notice">已解析：<b>${esc(info.scheme)}</b> · ${esc(info.host)}:${info.port}
-      · 传输 ${esc(info.transport)}${info.tls ? ' + TLS' : ''}${info.udp ? ' · UDP' : ''}${info.name ? ' · 备注 ' + esc(info.name) : ''}</div>`;
+      · 传输 ${esc(info.transport)}${info.tls ? ' + TLS' : ''}${info.udp ? ' · UDP' : ''}${info.user ? ' · 账号 ' + esc(info.user) : ''}${info.name ? ' · 备注 ' + esc(info.name) : ''}</div>`;
     if (autofill) {
       $('#f-udp').checked = !!info.udp;
       if (!$('#f-name').value) $('#f-name').value = (info.name || info.host) + '-节点';
@@ -1292,6 +1540,9 @@ async function saveNode(node) {
     inBps: rateEnabled ? Math.round(rateIn * 1e6 / 8) : 0,
     outBps: rateEnabled ? Math.round(rateOut * 1e6 / 8) : 0,
   };
+  const expireAt = parseBeijingInput($('#f-expire').value);
+  if (isNaN(expireAt)) { toast('到期时间格式无效', 'err'); return; }
+  if (expireAt && (!node || node.expireAt !== expireAt) && expireAt * 1000 <= Date.now()) { toast('到期时间必须晚于当前时间', 'err'); return; }
   const common = {
     name: $('#f-name').value.trim(),
     listenPort: parseInt($('#f-port').value || '0', 10) || 0,
@@ -1299,6 +1550,7 @@ async function saveNode(node) {
     connLimit: parseInt($('#f-connLimit').value || '0', 10) || 0,
     quota,
     rate,
+    expireAt,
   };
 
   let body;
@@ -1325,18 +1577,32 @@ async function saveNode(node) {
       gostCipher: $('#f-gost-cipher').value,
       gostPassword: ['ss', 'ssu'].includes(proto) ? $('#f-gost-ss-pass').value.trim() : $('#f-gost-pass').value.trim(),
       gostPath: $('#f-gost-path').value.trim(),
+      upstream: local ? upstreamBody() : null,
     }, common);
   } else if (mode === 'reality') {
-    const sni = $('#f-reality-sni').value.trim();
-    if (!sni) { toast('请填写伪装域名', 'err'); return; }
+    const sni = $('#f-reality-sni').value.trim(); // 留空由后端自动挑选
+    const accelOn = $('#f-accel').checked;
     body = Object.assign({
       mode: 'reality',
       udp: false,
       realitySni: sni,
+      realityTransport: accelOn ? $('#f-sb-transport').value : 'reality',
+      realityWsPath: accelOn ? $('#f-ws-path').value.trim() : '',
+      accelHost: accelOn ? $('#f-accel-host').value.trim() : '',
       realityUuid: $('#f-reality-uuid').value.trim(),
       realityShortId: $('#f-reality-sid').value.trim(),
       realityPub: $('#f-reality-pub').value.trim(),
       realityPriv: $('#f-reality-priv').value.trim(),
+      upstream: upstreamBody(),
+    }, Object.assign({}, common, { udp: false }));
+  } else if (mode === 'proxy') {
+    const host = $('#f-proxy-host').value.trim();
+    const port = parseInt($('#f-proxy-port').value || '0', 10) || 0;
+    if (!host) { toast('请填写落地机 IP / 域名', 'err'); return; }
+    if (!(port > 0 && port < 65536)) { toast('落地代理端口无效', 'err'); return; }
+    body = Object.assign({
+      mode: 'link',
+      proxy: { type: $('#f-proxy-type').value, host, port, user: $('#f-proxy-user').value.trim(), pass: $('#f-proxy-pass').value },
     }, Object.assign({}, common, { udp: false }));
   } else {
     const link = $('#f-link').value.trim();
@@ -1369,8 +1635,9 @@ async function openLinkModal(node) {
     <button class="modal-close" onclick="closeModal()">×</button>
     <h2>客户端链接 · ${esc(node.name)}</h2>
     ${state.publicHostPrivate ? `<div class="notice warn">当前服务器地址 ${esc(r.host)} 是内网地址，客户端无法连接，请到「系统设置」填写公网 IP 或域名。</div>` : ''}
-    <div class="notice">${gostNative ? '把下面地址用作 GOST 客户端的上游节点（<span class="mono">gost -F 地址</span>）' : '把下面链接导入兼容客户端'}，连接地址为本服务器 <b>${esc(r.host)}:${r.port}</b>。</div>
+    <div class="notice">${gostNative ? '把下面地址用作 GOST 客户端的上游节点（<span class="mono">gost -F 地址</span>）' : '把下面链接导入兼容客户端'}，连接地址为${r.accelHost ? `加速入口 <b>${esc(r.accelHost)}</b>（回源到本机 ${esc(r.host)}:${r.port}）` : `本服务器 <b>${esc(r.host)}:${r.port}</b>`}。</div>
     <div class="code-box" id="linkText">${esc(r.url)}</div>
+    ${r.directUrl ? `<div class="hint" style="margin-top:8px">直连本机（不经加速，排障用）：</div><div class="code-box">${esc(r.directUrl)}</div>` : ''}
     <div style="display:flex;gap:24px;margin-top:24px;align-items:flex-start;flex-wrap:wrap">
       <button class="btn" id="copyLinkBtn">${icon('copy')} 复制链接</button>
       <div>
@@ -1382,6 +1649,33 @@ async function openLinkModal(node) {
   `);
   $('#copyLinkBtn').onclick = () => copyText(r.url);
   if (node.mode === 'gost') renderDeploy(node, '#deployBox');
+}
+
+// openQRModal 节点二维码：大图 + 编码内容，供小火箭 / v2rayNG / v2rayN 等手机客户端扫码导入。
+async function openQRModal(node) {
+  let r = null;
+  try { r = await api(`api/nodes/${node.id}/link`); } catch (e) { toast(e.message, 'err'); return; }
+  const qrText = r.qrUrl || r.url;
+  const scheme = (qrText.split('://')[0] || '').toLowerCase();
+  const apps = { vless: 'Shadowrocket（小火箭）、v2rayNG、v2rayN、NekoBox、Clash Meta 系', vmess: 'Shadowrocket（小火箭）、v2rayNG、v2rayN、NekoBox、Clash 系', ss: 'Shadowrocket、v2rayNG、v2rayN、Clash 系', socks: 'v2rayNG、v2rayN、Shadowrocket', http: 'v2rayN、v2rayNG' }[scheme] || '支持该协议分享链接的客户端';
+  openModal(`
+    <button class="modal-close" onclick="closeModal()">×</button>
+    <h2>二维码 · ${esc(node.name)}</h2>
+    ${state.publicHostPrivate ? `<div class="notice warn">当前服务器地址 ${esc(r.host)} 是内网地址，手机无法连接，请到「系统设置」填写公网 IP 或域名。</div>` : ''}
+    <div class="qr-stage">
+      <div class="qr qr-large"><img src="${BASE}api/nodes/${node.id}/qrcode?t=${Date.now()}" alt="节点二维码"></div>
+      <div class="hint" style="text-align:center;margin-top:10px">用 ${esc(apps)} 的「扫码导入」扫描 · 连接地址 <span class="mono">${esc(r.accelHost || (r.host + ':' + r.port))}</span>${r.accelHost ? '（加速入口）' : ''}</div>
+    </div>
+    <div class="section-label">二维码内容</div>
+    <div class="code-box">${esc(qrText)}</div>
+    ${qrText !== r.url ? `<div class="hint" style="margin-top:6px">手机端按 v2rayN 约定使用 base64 鉴权写法；电脑端通用链接：<span class="mono">${esc(r.url)}</span></div>` : ''}
+    ${r.directUrl ? `<div class="hint" style="margin-top:6px">直连本机（不经加速）：<span class="mono">${esc(r.directUrl)}</span></div>` : ''}
+    <div class="modal-actions">
+      <button class="btn secondary" id="qrCopyBtn">${icon('copy')} 复制二维码内容</button>
+      <button class="btn" onclick="closeModal()">关闭</button>
+    </div>
+  `);
+  $('#qrCopyBtn').onclick = () => copyText(qrText);
 }
 
 // renderDeploy 拉取并渲染 GOST 体系节点的落地机部署命令与步骤。
@@ -1478,8 +1772,9 @@ async function openDetail(node) {
       : '<span class="tertiary">未启用流量配额</span>';
     body.innerHTML = `
       <div class="kv" style="margin-bottom:24px">
-        <div class="k">状态</div><div class="v">${statusTag(node.enabled, live.quotaBlocked)}</div>
-        <div class="k">落地机</div><div class="v mono">${node.mode === 'reality' ? '本机 sing-box（REALITY）' : (node.mode === 'gost' && node.gostLocal ? '本机直出' : `${esc(node.targetHost)}:${node.targetPort}`)} · ${esc(node.protocol)}</div>
+        <div class="k">状态</div><div class="v">${statusTag(node.enabled, live.quotaBlocked, nodeExpired(node))}</div>
+        <div class="k">到期时间</div><div class="v">${node.expireAt ? `${fmtBeijing(node.expireAt)}（北京时间）${nodeExpired(node) ? ' · <span class="error-text">已到期，服务已停止</span>' : ''}` : '<span class="tertiary">永不到期</span>'}</div>
+        <div class="k">落地机</div><div class="v mono">${node.mode === 'reality' ? '本机 sing-box（REALITY）' : (node.mode === 'gost' && node.gostLocal ? '本机直出' : `${esc(node.targetHost)}:${node.targetPort}`)} · ${esc(node.protocol)}${upstreamNote(node)}</div>
         <div class="k">监听端口</div><div class="v mono">${node.listenPort}${node.udp ? ' · 附加 UDP' : ''}</div>
         <div class="k">连接数</div><div class="v">当前 ${live.currentConns || 0} · 累计 ${live.totalConns || 0}</div>
         <div class="k">今日流量</div><div class="v mono">↑ ${fmtBytes(node.todayIn)} / ↓ ${fmtBytes(node.todayOut)}</div>
@@ -1549,7 +1844,7 @@ async function openNodeSub(node) {
       </div>
     </div>`;
   body.innerHTML = `
-    <div class="notice">${r.enabled ? '' : '<b>该节点已停用，订阅内容为空。</b> '}${schemeNote}</div>
+    <div class="notice">${r.expired ? '<b>该节点已到期，订阅内容为空。</b> ' : r.enabled ? '' : '<b>该节点已停用，订阅内容为空。</b> '}${schemeNote}</div>
     ${clientBlock}
     <div class="sub-grid">
       <div class="sub-item">
@@ -1649,13 +1944,15 @@ $('#tgTestBtn').onclick = async () => {
 /* ---------------- 系统设置 ---------------- */
 async function loadSystem() {
   try {
-    const [sys, st, sc] = await Promise.all([
+    const [sys, st, sc, tm] = await Promise.all([
       api('api/system'), api('api/settings'),
       api('api/sub-config').catch(() => null),
+      api('api/system/time').catch(() => null),
     ]);
     state.system = sys;
     state.settings = st;
     state.subConfig = sc;
+    state.time = tm;
     renderSystem();
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -1682,6 +1979,9 @@ function renderSystem() {
   if (document.activeElement !== $('#setSample')) $('#setSample').value = st.sampleSeconds;
   if (document.activeElement !== $('#setRetention')) $('#setRetention').value = st.retentionDays;
   if (document.activeElement !== $('#setLogLevel') && st.gostLogLevel) $('#setLogLevel').value = st.gostLogLevel;
+  $('#fwAuto').checked = st.firewallAuto !== false;
+  const fwName = { ufw: 'ufw', firewalld: 'firewalld', iptables: 'iptables（INPUT 默认拒绝）', none: '未检测到防火墙（无需放行）' }[st.firewallKind] || st.firewallKind || '—';
+  $('#fwInfo').innerHTML = `本机防火墙：<b>${esc(fwName)}</b>${(st.managedPorts || []).length ? ` · 面板已放行：<span class="mono">${esc(st.managedPorts.join('、'))}</span>` : ' · 面板尚未放行任何端口'}`;
 
   const g = sys.gost || {};
   const proc = g.process || {};
@@ -1696,7 +1996,59 @@ function renderSystem() {
   applyBrand(state.siteTitle);
 
   renderSubConfig();
+  renderTimeSync();
 }
+
+// renderTimeSync 渲染「时间同步」卡片：状态、NTP 服务、时区、服务器时间与浏览器差值、最近处理
+function renderTimeSync() {
+  const tm = state.time;
+  if (!tm) return;
+  const s = tm.status || {};
+  const stateHtml = {
+    synced: '<span class="status-inline"><span class="status-dot ok"></span>已由 NTP 校准</span>',
+    http: '<span class="status-inline"><span class="status-dot ok"></span>NTP 不可达，已按 HTTP 时间校正</span>',
+    unsynced: '<span class="status-inline"><span class="status-dot bad"></span>未同步</span>',
+  }[s.state] || '<span class="tertiary">无法判断</span>';
+  const diff = s.now ? Math.round(s.now - Date.now() / 1000) : null;
+  const diffHtml = diff === null ? '' : ` · 与本浏览器相差 <span class="${Math.abs(diff) > 30 ? 'error-text' : 'tertiary'}">${diff >= 0 ? '+' : ''}${diff} 秒</span>`;
+  const httpHtml = s.httpOffset === null || s.httpOffset === undefined ? '' : `<div class="hint">最近 HTTP 校验：偏差 ${s.httpOffset >= 0 ? '+' : ''}${Number(s.httpOffset).toFixed(1)} 秒（${fmtTime(s.httpCheckedAt)}）</div>`;
+  $('#timeInfo').innerHTML = `
+    <div class="k">状态</div><div class="v">${stateHtml}${s.manageable ? '' : ' <span class="tertiary">（无 timedatectl，容器内请在宿主机处理）</span>'}${httpHtml}</div>
+    <div class="k">NTP 服务</div><div class="v mono">${esc(s.ntpService || '未运行')}${s.ntpEnabled === false ? ' <span class="error-text">· timedatectl NTP=no</span>' : ''}</div>
+    <div class="k">服务器时间</div><div class="v mono">${s.now ? fmtTime(s.now) : '—'}${diffHtml}</div>
+    <div class="k">系统时区</div><div class="v mono">${esc(s.timezone || '—')}</div>
+    <div class="k">最近处理</div><div class="v">${s.lastActionAt ? `${fmtTime(s.lastActionAt)} · ${esc((s.lastAction || '').split('\n').pop())}` : '<span class="tertiary">尚未处理过</span>'}</div>`;
+  const last = $('#timeLast');
+  if (s.lastAction && s.lastAction.includes('\n')) { last.textContent = s.lastAction; last.classList.remove('hidden'); }
+  else last.classList.add('hidden');
+  $('#timeAutofix').checked = tm.autofix !== false;
+  if (document.activeElement !== $('#timeZone')) $('#timeZone').value = tm.serverTimezone || '';
+}
+
+$('#timeFixBtn').onclick = () => fixClock($('#timeFixBtn'), '立即校时');
+$('#fwAuto').onchange = async (e) => {
+  try {
+    await api('api/settings', { method: 'PUT', body: { firewallAuto: e.target.checked } });
+    toast(e.target.checked ? '已开启自动放行，节点端口已同步' : '已关闭自动放行，已收回面板放行的端口');
+    await loadSystem();
+  } catch (err) { toast(err.message, 'err'); e.target.checked = !e.target.checked; }
+};
+$('#timeAutofix').onchange = async (e) => {
+  try {
+    await api('api/settings', { method: 'PUT', body: { timeAutofix: e.target.checked } });
+    toast(e.target.checked ? '已开启自动校时' : '已关闭自动校时');
+  } catch (err) { toast(err.message, 'err'); e.target.checked = !e.target.checked; }
+};
+$('#timeZoneBtn').onclick = async () => {
+  const btn = $('#timeZoneBtn');
+  btn.disabled = true;
+  try {
+    await api('api/settings', { method: 'PUT', body: { serverTimezone: $('#timeZone').value.trim() } });
+    toast('时区已应用');
+    await loadSystem();
+  } catch (err) { toast(err.message, 'err'); }
+  finally { btn.disabled = false; }
+};
 
 // renderSubConfig 渲染「订阅与证书」卡片。证书区只有一个：
 // 直接显示当前生效证书（ACME 或手动）的证书/私钥内容；
@@ -1711,7 +2063,8 @@ function renderSubConfig() {
   if (ae !== $('#subDomain')) $('#subDomain').value = sc.domain || '';
   if (ae !== $('#subEmail')) $('#subEmail').value = sc.email || '';
 
-  $('#subPreview').innerHTML = `订阅地址示例：<b class="mono">${esc(sc.sampleURL || '')}</b> · 当前协议 <b>${sc.tls ? 'HTTPS' : 'HTTP'}</b>`;
+  $('#subPreview').innerHTML = `订阅地址示例：<b class="mono">${esc(sc.sampleURL || '')}</b> · 当前协议 <b>${sc.tls ? 'HTTPS' : 'HTTP'}</b>`
+    + (sc.listening === false ? `<br><span class="error-text">订阅服务未在监听：${esc(sc.listenError || '端口绑定失败')}</span>` : '');
 
   const c = sc.cert || {};
   if (c.mode === 'manual' || c.mode === 'acme') {

@@ -30,11 +30,7 @@ type Result struct {
 // clientLink 解析并改写单个节点的落地链接，返回指向中转机的链接与解析结果。
 func clientLink(n *model.Node, host string) (string, *link.Info, error) {
 	if n.IsReality() {
-		cred := &singbox.RealityCred{
-			UUID: n.RealityUUID, PublicKey: n.RealityPub,
-			ShortID: n.RealityShortID, ServerName: n.RealitySNI,
-		}
-		return singbox.ClientURL(cred, n.ListenPort, host, n.Name), nil, nil
+		return singbox.NodeClientURL(n, host), nil, nil
 	}
 	if n.Mode == "gost" {
 		out, err := gostmgr.GostClientURL(n, host, n.ListenPort)
@@ -61,7 +57,7 @@ func clientLink(n *model.Node, host string) (string, *link.Info, error) {
 	return out, info, nil
 }
 
-// Collect 遍历节点，生成每个已启用节点的中转链接与名称。
+// Collect 遍历节点，生成每个已启用且未到期节点的中转链接与名称。
 // host 为中转机对外地址（公网 IP / 域名），空则返回错误。
 func Collect(nodes []*model.Node, host string) (*Result, error) {
 	host = strings.TrimSpace(host)
@@ -70,7 +66,7 @@ func Collect(nodes []*model.Node, host string) (*Result, error) {
 	}
 	res := &Result{}
 	for _, n := range nodes {
-		if n == nil || !n.Enabled {
+		if n == nil || !n.Serving() {
 			continue
 		}
 		out, _, err := clientLink(n, host)

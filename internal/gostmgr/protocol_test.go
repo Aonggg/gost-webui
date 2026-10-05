@@ -3,6 +3,7 @@ package gostmgr
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"gost-webui/internal/model"
 )
@@ -146,6 +147,66 @@ func TestBuildConfigLocalShadowsocksUDP(t *testing.T) {
 	}
 	if cfg.Services[0].Handler.Type != "ss" || cfg.Services[1].Handler.Type != "ssu" || cfg.Services[1].Listener.Type != "udp" {
 		t.Fatalf("unexpected SS services: %#v", cfg.Services)
+	}
+}
+
+// 到期节点不得生成任何 gost 服务（等同停用）；未到期的照常生成，ExpireAt=0 永不到期。
+func TestBuildConfigSkipsExpiredNode(t *testing.T) {
+	mk := func(id string, expireAt int64) *model.Node {
+		return &model.Node{
+			ID: id, Mode: "gost", Enabled: true, GostLocal: true, ExpireAt: expireAt,
+			ListenPort: 8388, GostProtocol: "ss", GostTransport: "tcp",
+			GostCipher: "aes-256-gcm", GostPassword: "secret",
+		}
+	}
+	now := time.Now().Unix()
+	cfg := BuildConfig([]*model.Node{mk("expired", now-1), mk("edge", now), mk("future", now+60), mk("never", 0)}, BuildOptions{})
+	var names []string
+	for _, s := range cfg.Services {
+		names = append(names, s.Name)
+	}
+	want := []string{model.TCPName("future"), model.TCPName("never")}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("services = %v, want %v", names, want)
+	}
+}
+
+// 本机落地 + 出口代理：生成 chain 并让服务 handler 引用；出口只走 TCP，不生成 UDP 服务；
+// https 出口为 http 连接器 + TLS 拨号。远程落地/无出口的节点不产生 chain。
+func TestBuildConfigUpstreamChain(t *testing.T) {
+	n := &model.Node{
+		ID: "up", Mode: "gost", Enabled: true, GostLocal: true, UDP: true,
+		ListenPort: 8388, GostProtocol: "ss", GostTransport: "tcp",
+		GostCipher: "aes-256-gcm", GostPassword: "secret",
+		Upstream: &model.Upstream{Type: "socks5", Host: "1.2.3.4", Port: 1080, User: "u", Pass: "p"},
+	}
+	plain := &model.Node{
+		ID: "plain", Mode: "gost", Enabled: true, GostLocal: true,
+		ListenPort: 8389, GostProtocol: "ss", GostTransport: "tcp",
+		GostCipher: "aes-256-gcm", GostPassword: "secret",
+	}
+	cfg := BuildConfig([]*model.Node{n, plain}, BuildOptions{})
+	if len(cfg.Chains) != 1 || cfg.Chains[0].Name != ChainName("up") {
+		t.Fatalf("chains = %+v, want one chain for node up", cfg.Chains)
+	}
+	hop := cfg.Chains[0].Hops[0].Nodes[0]
+	if hop.Addr != "1.2.3.4:1080" || hop.Connector.Type != "socks5" || hop.Connector.Auth.Username != "u" || hop.Dialer.Type != "tcp" {
+		t.Fatalf("chain node = %+v", hop)
+	}
+	var names []string
+	for _, s := range cfg.Services {
+		names = append(names, s.Name+":"+s.Handler.Chain)
+	}
+	want := model.TCPName("up") + ":" + ChainName("up") + "," + model.TCPName("plain") + ":"
+	if strings.Join(names, ",") != want {
+		t.Fatalf("services = %v, want %s（出口代理不生成 UDP 服务）", names, want)
+	}
+
+	n.Upstream = &model.Upstream{Type: "https", Host: "proxy.example.com", Port: 443}
+	ch := BuildChain(n)
+	hop = ch.Hops[0].Nodes[0]
+	if hop.Connector.Type != "http" || hop.Connector.Auth != nil || hop.Dialer.Type != "tls" || hop.Dialer.TLS == nil || hop.Dialer.TLS.ServerName != "proxy.example.com" || !hop.Dialer.TLS.Secure {
+		t.Fatalf("https chain node = %+v", hop)
 	}
 }
 

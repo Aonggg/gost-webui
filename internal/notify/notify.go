@@ -20,6 +20,7 @@ const (
 	EventNodeUp       = "nodeUp"       // 中转节点上线
 	EventNodeDown     = "nodeDown"     // 中转节点下线/异常
 	EventQuotaBlocked = "quotaBlocked" // 流量超限暂停
+	EventNodeExpired  = "nodeExpired"  // 节点到期停用
 	EventTrafficWarn  = "trafficWarn"  // 流量预警
 	EventLoadWarn     = "loadWarn"     // 服务器负载预警
 	EventPanelStart   = "panelStart"   // 面板启动
@@ -35,6 +36,7 @@ func AllEvents() map[string]string {
 		EventNodeUp:       "节点上线",
 		EventNodeDown:     "节点下线",
 		EventQuotaBlocked: "流量超限暂停",
+		EventNodeExpired:  "节点到期",
 		EventTrafficWarn:  "流量预警",
 		EventLoadWarn:     "服务器负载预警",
 		EventPanelStart:   "面板启动",

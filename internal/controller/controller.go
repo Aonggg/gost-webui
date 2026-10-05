@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,16 +46,21 @@ type Controller struct {
 	// nodes 缓存，避免采样时频繁读库
 	nodes  []*model.Node
 	gostOK bool
+	// expiredPrev 记录上轮采样时各 gost 节点的到期状态，用于识别"到期解除"翻转
+	expiredPrev map[string]bool
+	// ExtraPorts 返回除节点外也需放行的端口（订阅监听等），由 server 注入。
+	ExtraPorts func() []int
 }
 
 // New 创建控制器。
 func New(st *store.Store, mgr *gostmgr.Manager, log *slog.Logger, opts Options) *Controller {
 	return &Controller{
-		Store: st,
-		Gost:  mgr,
-		Log:   log,
-		Opts:  opts,
-		live:  make(map[string]*model.Live),
+		Store:       st,
+		Gost:        mgr,
+		Log:         log,
+		Opts:        opts,
+		live:        make(map[string]*model.Live),
+		expiredPrev: make(map[string]bool),
 	}
 }
 
@@ -69,6 +75,7 @@ func (c *Controller) Bootstrap(ctx context.Context) error {
 		return err
 	}
 	c.syncReality(ctx)
+	c.SyncFirewall(ctx)
 	// gost 每次（重新）启动后，等待 API 就绪并校正配额计数
 	c.Gost.SetOnStarted(func() {
 		rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -143,8 +150,14 @@ func (c *Controller) SyncConfigFile() error {
 	return c.Gost.WriteConfig(cfg)
 }
 
-// ApplyNode 将节点同步到底层引擎（gost 服务/配额/限速，或 sing-box 实例）。
+// ApplyNode 将节点同步到底层引擎（gost 服务/配额/限速，或 sing-box 实例），并同步防火墙放行。
 func (c *Controller) ApplyNode(ctx context.Context, n *model.Node) error {
+	err := c.applyNode(ctx, n)
+	c.SyncFirewall(ctx)
+	return err
+}
+
+func (c *Controller) applyNode(ctx context.Context, n *model.Node) error {
 	if n.IsReality() {
 		return c.applyReality(ctx, n)
 	}
@@ -190,13 +203,21 @@ func (c *Controller) ApplyNode(ctx context.Context, n *model.Node) error {
 		_ = cl.DeleteLimiter(ctx, "climiters", model.CLimiterName(n.ID))
 	}
 
-	// 3. 服务
-	if !n.Enabled {
+	// 2b. 出口代理链（必须先于引用它的服务存在；不再需要时服务删除后再清理）
+	for _, ch := range cfg.Chains {
+		if err := cl.UpsertChain(ctx, ch); err != nil {
+			return err
+		}
+	}
+
+	// 3. 服务（停用或已到期的节点不保留任何服务）
+	if !n.Serving() {
 		for _, name := range []string{model.TCPName(n.ID), model.UDPName(n.ID)} {
 			if err := cl.DeleteService(ctx, name); err != nil {
 				return err
 			}
 		}
+		_ = cl.DeleteChain(ctx, gostmgr.ChainName(n.ID))
 		return c.SyncConfigFile()
 	}
 	for _, s := range cfg.Services {
@@ -222,11 +243,21 @@ func (c *Controller) ApplyNode(ctx context.Context, n *model.Node) error {
 			return err
 		}
 	}
+	if len(cfg.Chains) == 0 {
+		// 出口代理被移除：服务已不再引用，顺手清掉旧链
+		_ = cl.DeleteChain(ctx, gostmgr.ChainName(n.ID))
+	}
 	return c.SyncConfigFile()
 }
 
-// RemoveNode 从引擎中删除节点相关资源。
+// RemoveNode 从引擎中删除节点相关资源，并收回防火墙放行。
 func (c *Controller) RemoveNode(ctx context.Context, n *model.Node) error {
+	err := c.removeNode(ctx, n)
+	c.SyncFirewall(ctx)
+	return err
+}
+
+func (c *Controller) removeNode(ctx context.Context, n *model.Node) error {
 	if n.IsReality() {
 		if c.SB != nil {
 			c.SB.Remove(n.ID)
@@ -242,6 +273,7 @@ func (c *Controller) RemoveNode(ctx context.Context, n *model.Node) error {
 	}
 	keep(cl.DeleteService(ctx, model.TCPName(n.ID)))
 	keep(cl.DeleteService(ctx, model.UDPName(n.ID)))
+	keep(cl.DeleteChain(ctx, gostmgr.ChainName(n.ID)))
 	keep(cl.DeleteQuota(ctx, model.QuotaName(n.ID)))
 	keep(cl.DeleteLimiter(ctx, "limiters", model.LimiterName(n.ID)))
 	keep(cl.DeleteLimiter(ctx, "climiters", model.CLimiterName(n.ID)))
@@ -264,7 +296,7 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 		index[q.Name] = q
 	}
 	for _, n := range c.Nodes() {
-		if n.IsReality() || !n.Enabled || !n.Quota.Enabled || n.Quota.Bytes <= 0 {
+		if n.IsReality() || !n.Serving() || !n.Quota.Enabled || n.Quota.Bytes <= 0 {
 			continue
 		}
 		name := model.QuotaName(n.ID)
@@ -404,14 +436,18 @@ func (c *Controller) applyReality(ctx context.Context, n *model.Node) error {
 	if c.SB == nil {
 		return fmt.Errorf("面板未启用 sing-box 引擎")
 	}
-	cred := &singbox.RealityCred{
-		UUID:       n.RealityUUID,
-		PrivateKey: n.RealityPriv,
-		PublicKey:  n.RealityPub,
-		ShortID:    n.RealityShortID,
-		ServerName: n.RealitySNI,
+	cred := singbox.CredOf(n)
+	// 所有节点的监听端口都要避开（clash API 端口与之冲突会让实例起不来）
+	var ports []int
+	for _, o := range c.Nodes() {
+		ports = append(ports, o.ListenPort)
 	}
-	return c.SB.Apply(ctx, n.ID, n.ListenPort, cred, n.Enabled)
+	if _, ps, err := net.SplitHostPort(c.Opts.APIAddr); err == nil {
+		if v, err := strconv.Atoi(ps); err == nil {
+			ports = append(ports, v)
+		}
+	}
+	return c.SB.Apply(ctx, n.ID, n.ListenPort, cred, n.Upstream, ports, n.Serving())
 }
 
 // syncReality 根据当前节点列表拉起/清理 sing-box 实例。

@@ -20,6 +20,7 @@
 
 - **一键安装**：脚本自动装 Go（如需编译）、编译/下载 gost、部署面板并注册 systemd 服务
 - **粘贴即用**：粘贴落地机的 `vmess://` `vless://` `trojan://` `ss://` `hysteria2://` `tuic://` 链接，
+  或落地机的 `http://` `https://` `socks5://` 代理地址（含 v2rayN 的 `socks://base64` 写法），
   自动解析协议、地址、端口、UUID/密码、TLS/SNI/WS 等参数，并生成客户端新链接（含二维码）
 - **TCP + UDP 转发**：hysteria2 / tuic / KCP / QUIC 等 UDP 协议自动开启 UDP 转发
 - **本机落地**：同一台服务器上的 GOST 进程可直接运行代理服务，不再需要第二台落地机或额外 systemd 服务
@@ -47,7 +48,7 @@ sudo bash install.sh --port 9000 --path /panel --user admin --pass '你的密码
 # 或环境变量：PANEL_PORT / BASE_PATH / PANEL_USER / PANEL_PASS
 
 # 方式二：远程一键（需先发布到 GitHub，见下文「发布与一键安装」）
-curl -fsSL https://raw.githubusercontent.com/baiduxc/gost-webui/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Aonggg/gost-webui/main/install.sh | sudo bash
 ```
 
 安装脚本会：
@@ -88,7 +89,7 @@ sudo bash /opt/gost-webui/install.sh --uninstall
 
 ## 发布与一键安装（重要）
 
-> 本仓库地址：`https://github.com/baiduxc/gost-webui`，所有下载直连 GitHub。
+> 本仓库地址：`https://github.com/Aonggg/gost-webui`（基于 baiduxc/gost-webui 二次开发），所有下载直连 GitHub。
 > 服务器无法访问 GitHub 时，用 `--gost-bin` / `--panel-bin` 指定已下载的二进制（见下文）。
 
 面板采用「源码仓库即安装源」的方式发布，**新服务器一条命令即可装好 gost + 面板**。
@@ -98,14 +99,14 @@ sudo bash /opt/gost-webui/install.sh --uninstall
 编辑 `install.sh` 顶部的仓库地址（改成你自己的）：
 
 ```bash
-DEFAULT_PANEL_REPO="https://github.com/baiduxc/gost-webui"
+DEFAULT_PANEL_REPO="https://github.com/Aonggg/gost-webui"
 ```
 
 ### 第 2 步：提交到 GitHub
 
 ```bash
 git init && git add -A && git commit -m "release v1.1.0"
-git remote add origin https://github.com/baiduxc/gost-webui.git
+git remote add origin https://github.com/Aonggg/gost-webui.git
 git push -u origin main
 ```
 
@@ -122,11 +123,11 @@ gh release create v1.1.0 dist/gost-webui_1.1.0_linux_*.tar.gz --title "v1.1.0"
 
 ```bash
 # 方式 A：源码构建（脚本自动安装 Go、编译 gost 与面板，约 3~10 分钟）
-curl -fsSL https://raw.githubusercontent.com/baiduxc/gost-webui/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Aonggg/gost-webui/main/install.sh | sudo bash
 
 # 方式 B：使用 Release 预编译包（最快，几秒钟，{arch} 按机器架构自动替换）
-curl -fsSL https://raw.githubusercontent.com/baiduxc/gost-webui/main/install.sh \
-  | sudo PANEL_RELEASE_URL="https://github.com/baiduxc/gost-webui/releases/download/v1.1.0/gost-webui_1.1.0_linux_{arch}.tar.gz" bash
+curl -fsSL https://raw.githubusercontent.com/Aonggg/gost-webui/main/install.sh \
+  | sudo PANEL_RELEASE_URL="https://github.com/Aonggg/gost-webui/releases/download/v1.9.0/gost-webui_1.9.0_linux_{arch}.tar.gz" bash
 
 # 自定义端口 / 账号密码 / 访问路径：
 #   curl -fsSL .../install.sh | sudo bash -s -- --port 9000 --path /panel --user admin --pass 你的密码
@@ -177,6 +178,21 @@ SNI 透明代理本身不提供账号认证；公网使用时应限制安全组�
 | WS 的 `path`、gRPC 的 `serviceName`、Reality 的 `pbk/sid` 等 | 原样保留 |
 | `ss://` 旧格式（整段 base64） | 自动转成 SIP002 格式 |
 | hysteria2 / tuic / KCP / QUIC | 自动勾选「同时转发 UDP」 |
+| `http://` / `socks5://` 落地代理 | 鉴权原样保留，只改地址端口；Clash 输出 `http` / `socks5` 类型；SOCKS5 的 UDP ASSOCIATE 会指向落地机真实地址，故不转发 UDP |
+| `https://` 落地代理 | 视为 TLS，SNI 取落地域名并随链接带上，Clash 输出 `http` + `tls: true` + `sni` |
+| `socks://base64(user:pass@host:port)` 旧格式 | 自动转成 `socks://base64(user:pass)@host:port` |
+
+### 出口代理（落地机 SOCKS5 / HTTP）
+
+「GOST 体系 → 本机」与「VLESS + REALITY」节点可选填**出口代理**：客户端 → 本机走入站协议（SS / REALITY …）加密，
+本机 → 落地机走 SOCKS5 / HTTP(S)，再由落地机出网。适用于"落地只有 SOCKS5/HTTP 账号、客户端在国内"的场景——
+明文 SOCKS5/HTTP 直通中转（「HTTP / SOCKS5 代理」页）从大陆直连境外会被墙识别阻断（握手后丢包、SYN 被丢），
+仅适合客户端不在墙内的情况。
+
+- gost：`BuildChain` 生成 `chains[]`（connector `socks5`/`http` + dialer `tcp`/`tls`），服务 `handler.chain` 引用；
+  SOCKS5 连接器带 `notls: true`，否则 gost 会多发私有方法 0x80/0x82，第三方落地直接断开
+- sing-box：`outboundFor` 生成 `socks`（version 5）或 `http`（https 时 `tls.server_name` 取代理域名）出站
+- 出口代理只走 TCP：gost 不生成 `ssu` UDP 服务，表单隐藏 UDP 开关；编辑时密码留空沿用旧密码
 
 ## 流量统计与限制说明
 
@@ -187,6 +203,10 @@ SNI 透明代理本身不提供账号认证；公网使用时应限制安全组�
   - 达到额度后：该节点的中转服务自动停止接受新连接；进入新周期后自动恢复
   - **计数兜底恢复**：若 gost 进程被强杀导致计数未落盘，面板会依据自身流量明细在秒级内把配额计数恢复回来；
     跨周期（跨天/跨月）时面板会自动切换配额窗口，让计数清零并恢复服务
+- **到期时间**：节点可设置 `expireAt`（Unix 秒，0 为永不到期），前端按**北京时间（UTC+8）**录入与展示，服务端只比较绝对时间，与服务器时区无关
+  - 判定统一走 `model.Node.Serving()`（已启用且未到期）：gost 配置生成、`ApplyNode`、配额校正、订阅输出、sing-box 拉起都以它为准
+  - 采样器（默认 15 秒）发现运行中的节点已到期即拆除 gost 服务 / 停止 sing-box 实例，并发送「节点到期」通知；把到期时间改到将来后保存即重新拉起
+  - 已到期节点的「启用」开关会被拒绝（需先延长到期时间）；编辑已到期节点的其它字段时允许保留原到期时间
 - **限速**：基于 gost traffic limiter，按节点设置上行/下行速率（字节/秒，界面按 Mbps 换算）
 - **连接数限制**：基于 gost climiter
 - **重置流量**：节点详情 → 重置流量（清零配额计数与面板累计）
@@ -325,6 +345,30 @@ A：换一个端口，或确认该端口未被其它程序占用（gost 需要�
 **Q：客户端连不上，日志里能看到转发但无响应？**
 A：检查落地机地址端口是否可达（可在中转机上 `curl -v telnet://落地IP:端口` 测试），
 以及落地机防火墙是否放行了中转机 IP。
+
+**Q：节点用着用着「突然没网」，在服务器上开了 NTP（`timedatectl set-ntp true`）才恢复？**
+A：根因是**系统时钟没有校准**。gost 原始转发、本机 SS/SOCKS/HTTP、sing-box REALITY（未设 `max_time_difference`）
+本身不校验时间，但很多协议/环节依赖准确时间：VMess 要求两端误差 ≤ 2 分钟，Shadowsocks-2022 ≤ 30 秒，
+开启了时间差校验的 REALITY、TLS 证书签发/校验、以及面板的到期与配额窗口判定。没有 NTP 守护进程的 VPS
+时钟会持续漂移，累计到阈值后握手全部失败，表现就是"突然没网"。面板把"时钟必须正确"做成了守护，不依赖服务器原本装没装 NTP：
+1. **一套逻辑**在 `internal/system/timesync.go`（`gost-webui -timesync [-timezone Asia/Shanghai]`），安装脚本、`go-ui` 菜单 9、
+   面板 API 与后台守护都调它：复用已装的 chrony / ntpd / ntpsec / openntpd / systemd-timesyncd（谁在就用谁，不装第二个）；
+   一个都没有则 apt 装 systemd-timesyncd、dnf/yum 装 chrony；给 timesyncd 写入全球 + 中国大陆都可达的服务器列表
+   （`/etc/systemd/timesyncd.conf.d/gost-webui.conf`）；`timedatectl set-ntp true`；等待内核 `STA_UNSYNC` 清除
+2. **NTP 被封（UDP 123 不通）也能校**：并发请求 Cloudflare / Google / Apple / Microsoft / 百度 / 阿里云的 HTTPS `Date` 头。
+   握手时跳过证书校验（本机时钟错时按本机时间必然验不过），但拿到 `Date` 后用**站点声称的时刻**重新校验证书链对该域名是否有效——
+   路径上伪造 Date 头的攻击者拿不到对应域名在任何时刻都有效的证书，样本直接丢弃；再要求至少 2 个站点结果在 10 秒内一致，
+   取中位数，偏差超过 2 秒就 `settimeofday` 直接校正并写回硬件时钟（状态显示为 `http`，每 30 分钟复查）
+3. **后台守护** `system.TimeGuard`：每分钟读内核 `adjtimex` 同步标志；未同步且「自动校时」开启（默认开）就后台修复，
+   失败按 2/5/15/30/60 分钟退避重试；状态在「系统设置 → 时间同步」卡片（状态 / NTP 服务 / 时区 / 服务器时间与浏览器差值 / 最近处理），
+   概览页未同步时显示黄色警告；持续 5 分钟仍未解决才发 Telegram（给自动修复留时间，避免误报）
+4. **时区**：安装脚本默认 `timedatectl set-timezone Asia/Shanghai`（`--timezone ""` 跳过，`--timezone Europe/London` 自定义），
+   systemd 单元同时写 `Environment=TZ=…`；「系统设置 → 服务器时区」保存后同时改系统时区与面板进程自身的 `time.Local`（启动时也会从设置读取覆盖单元里的 TZ），
+   面板/gost/sing-box 的日志与每日配额重置按该时区。
+   节点到期时间按绝对时间比较与时区无关；若时钟被校正回退导致"到期解除"，采样器会自动重新拉起服务
+5. **容器**：没有 timedatectl / CAP_SYS_TIME 时只能检测不能修，卡片会提示在宿主机处理
+6. **卸载**：`gost-webui -fw-release` 读取数据库里的 `fw_managed` 记录，收回面板自动放行过的节点 / 订阅端口并清空记录；
+   `install.sh --uninstall`、`uninstall.sh` 与 `go-ui` 的「干净卸载」都会在停止服务后调用它，并删除 timesyncd 配置片段
 
 **Q：为什么「今日流量」和客户端统计对不上？**
 A：中转机统计的是经过本机的字节数（含协议开销），且采样间隔内会有少量聚合误差，属正常现象。

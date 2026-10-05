@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"gost-webui/internal/cert"
+	"gost-webui/internal/config"
 	"gost-webui/internal/model"
 	"gost-webui/internal/sub"
 )
@@ -31,7 +33,18 @@ type subSettings struct {
 	KeyPEM  string
 }
 
+// panelPort 返回面板当前监听端口（设置里改过端口则以设置为准）。
+func (s *Server) panelPort() int {
+	if _, p, err := net.SplitHostPort(s.effectiveListen()); err == nil {
+		if n, err := strconv.Atoi(p); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
 // readSubSettings 读取并规范化订阅设置。
+// 未显式设置订阅端口且默认端口与面板端口相同时，顺延一位，避免同机安装时两者互相抢占。
 func (s *Server) readSubSettings() subSettings {
 	st := s.ctl.Store
 	set := subSettings{Port: defaultSubPort, Suffix: defaultSubSuffix}
@@ -39,9 +52,11 @@ func (s *Server) readSubSettings() subSettings {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 1 && n <= 65535 {
 			set.Port = n
 		}
+	} else if set.Port == s.panelPort() {
+		set.Port++
 	}
 	if v, ok := st.GetSetting("sub_suffix"); ok {
-		set.Suffix = normalizeSubSuffix(v)
+		set.Suffix, _ = normalizeSubSuffix(v)
 	}
 	if v, ok := st.GetSetting("sub_domain"); ok {
 		set.Domain = strings.ToLower(strings.TrimSpace(v))
@@ -59,19 +74,23 @@ func (s *Server) readSubSettings() subSettings {
 }
 
 // normalizeSubSuffix 规范化路径后缀：补前导斜杠、去尾部斜杠；空则返回默认。
-func normalizeSubSuffix(v string) string {
+// ok=false 表示含非法字符（会让 ServeMux 注册 panic），此时返回默认后缀兜底。
+func normalizeSubSuffix(v string) (sfx string, ok bool) {
 	v = strings.TrimSpace(v)
 	if v == "" {
-		return defaultSubSuffix
+		return defaultSubSuffix, true
 	}
 	if !strings.HasPrefix(v, "/") {
 		v = "/" + v
 	}
 	v = strings.TrimRight(v, "/")
 	if v == "" {
-		return defaultSubSuffix
+		return defaultSubSuffix, true
 	}
-	return v
+	if !config.ValidPathPrefix(v) {
+		return defaultSubSuffix, false
+	}
+	return v, true
 }
 
 // SetCertProvider 注入证书管理器（由 main 调用）。
@@ -134,10 +153,20 @@ func (s *Server) StartSubscription(ctx context.Context) {
 }
 
 // RestartSubscription 热重启订阅监听器（改端口/后缀/域名/证书后调用，无需重启面板）。
-func (s *Server) RestartSubscription() {
-	if err := s.restartSubscription(); err != nil {
+// 返回监听失败的原因（端口被占用等），nil 表示已正常监听。
+func (s *Server) RestartSubscription() error {
+	err := s.restartSubscription()
+	if err != nil {
 		s.log.Warn("订阅监听器重启失败", "err", err)
 	}
+	return err
+}
+
+// SubError 返回当前订阅监听器的故障原因；nil 表示监听正常。
+func (s *Server) SubError() error {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	return s.subErr
 }
 
 // StopSubscription 停止订阅监听器。
@@ -152,6 +181,7 @@ func (s *Server) StopSubscription(ctx context.Context) {
 }
 
 // restartSubscription 优雅停旧起新：读取设置、刷新证书、按后缀构建路由并监听。
+// 端口同步绑定，失败立即返回（并记录到 subErr），不会出现"日志里一行 WARN、界面上照常显示订阅地址"的假象。
 func (s *Server) restartSubscription() error {
 	s.subMu.Lock()
 	ctx := s.subCtx
@@ -178,8 +208,22 @@ func (s *Server) restartSubscription() error {
 		}
 	}
 
+	addr := ":" + strconv.Itoa(set.Port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		if set.Port == s.panelPort() {
+			err = fmt.Errorf("订阅端口 %d 与面板端口相同，请在「订阅与证书」中改用其它端口", set.Port)
+		} else {
+			err = fmt.Errorf("订阅端口 %d 监听失败（被其它程序占用？）: %w", set.Port, err)
+		}
+		s.subMu.Lock()
+		s.subErr = err
+		s.subMu.Unlock()
+		return err
+	}
+
 	srv := &http.Server{
-		Addr:              ":" + strconv.Itoa(set.Port),
+		Addr:              addr,
 		Handler:           s.subHandler(set.Suffix),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -193,19 +237,25 @@ func (s *Server) restartSubscription() error {
 
 	s.subMu.Lock()
 	s.subSrv = srv
+	s.subErr = nil
 	s.subMu.Unlock()
 
 	go func() {
 		var err error
 		if useTLS {
-			s.log.Info("订阅监听器已启动 (HTTPS)", "addr", srv.Addr, "suffix", set.Suffix, "domain", set.Domain)
-			err = srv.ListenAndServeTLS("", "")
+			s.log.Info("订阅监听器已启动 (HTTPS)", "addr", addr, "suffix", set.Suffix, "domain", set.Domain)
+			err = srv.ServeTLS(ln, "", "")
 		} else {
-			s.log.Info("订阅监听器已启动 (HTTP)", "addr", srv.Addr, "suffix", set.Suffix)
-			err = srv.ListenAndServe()
+			s.log.Info("订阅监听器已启动 (HTTP)", "addr", addr, "suffix", set.Suffix)
+			err = srv.Serve(ln)
 		}
 		if err != nil && err != http.ErrServerClosed {
 			s.log.Warn("订阅监听器退出", "err", err)
+			s.subMu.Lock()
+			if s.subSrv == srv {
+				s.subErr = err
+			}
+			s.subMu.Unlock()
 		}
 	}()
 	return nil

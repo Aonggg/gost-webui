@@ -169,6 +169,28 @@ func (c *Controller) sampleOnce(ctx context.Context) {
 			totalConns += item.totalConns
 			errs += item.errs
 		}
+		expired := n.Expired()
+		c.mu.Lock()
+		wasExpired := c.expiredPrev[n.ID]
+		c.expiredPrev[n.ID] = expired
+		c.mu.Unlock()
+		if running && expired {
+			// 到期：拆除 gost 服务（ApplyNode 对非 Serving 节点即删服务并回写配置文件）；
+			// 本轮采到的流量仍按常规结算
+			c.Log.Info("节点已到期，停止服务", "node", n.Name, "expireAt", n.ExpireAt)
+			if err := c.ApplyNode(sctx, n); err != nil {
+				c.Log.Warn("停止到期节点失败", "node", n.ID, "err", err)
+			} else {
+				running = false
+				curConns = 0
+			}
+		} else if !running && wasExpired && n.Serving() {
+			// 到期状态自行解除（典型：系统时钟被 NTP 校正回退）：重新拉起服务，无需人工编辑
+			c.Log.Info("节点到期状态解除，恢复服务", "node", n.Name, "expireAt", n.ExpireAt)
+			if err := c.ApplyNode(sctx, n); err != nil {
+				c.Log.Warn("恢复节点失败", "node", n.ID, "err", err)
+			}
+		}
 
 		prev, seen := lastCounters.m[n.ID]
 		if !seen {
@@ -334,14 +356,19 @@ func (c *Controller) sampleReality(ctx context.Context, hour int64) {
 			}
 			blocked = used >= limit
 		}
-		if blocked && st.Running {
-			c.Log.Info("reality 节点超配额，暂停实例", "node", n.Name, "used", used, "limit", limit)
+		expired := n.Expired()
+		if (blocked || expired) && st.Running {
+			if expired {
+				c.Log.Info("reality 节点已到期，停止实例", "node", n.Name, "expireAt", n.ExpireAt)
+			} else {
+				c.Log.Info("reality 节点超配额，暂停实例", "node", n.Name, "used", used, "limit", limit)
+			}
 			if err := c.applyReality(ctx, &model.Node{ID: n.ID, ListenPort: n.ListenPort, Enabled: false}); err != nil {
 				c.Log.Warn("暂停实例失败", "node", n.ID, "err", err)
 			}
 			st.Running = false
 			st.Ready = false
-		} else if !blocked && n.Enabled && !st.Running {
+		} else if !blocked && n.Serving() && !st.Running {
 			c.Log.Info("reality 节点恢复，拉起实例", "node", n.Name)
 			_ = c.applyReality(ctx, n)
 		}

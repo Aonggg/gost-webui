@@ -27,7 +27,15 @@ fi
 
 pkill -f "${PANEL_DIR}/bin/gost-webui" >/dev/null 2>&1 || true
 pkill -f "${PANEL_DIR}/bin/gost" >/dev/null 2>&1 || true
+pkill -f "${PANEL_DIR}/bin/sing-box" >/dev/null 2>&1 || true
 sleep 1
+
+# 收回面板运行期间自动放行的节点/订阅端口（记录在数据库里，只有面板自己知道）
+if [ -x "$PANEL_DIR/bin/gost-webui" ]; then
+  info "收回面板放行的防火墙端口…"
+  "$PANEL_DIR/bin/gost-webui" -c "$CONF_DIR/panel.yml" -fw-release 2>/dev/null || true
+fi
+rm -f /etc/systemd/timesyncd.conf.d/gost-webui.conf
 
 info "删除程序目录 ${PANEL_DIR}"
 rm -rf "$PANEL_DIR"

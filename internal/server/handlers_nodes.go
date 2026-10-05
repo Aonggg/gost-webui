@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -20,15 +21,19 @@ import (
 
 // nodeInput 是新增/编辑节点的请求体。
 type nodeInput struct {
-	Name       string `json:"name"`
-	Link       string `json:"link"`
-	ListenPort int    `json:"listenPort"`
-	UDP        *bool  `json:"udp"`
-	TargetHost string `json:"targetHost"`
-	TargetPort int    `json:"targetPort"`
-	SNI        string `json:"sni"`
-	Host       string `json:"host"`
-	Enabled    *bool  `json:"enabled"`
+	Name string `json:"name"`
+	Link string `json:"link"`
+	// Proxy 是"填写地址"方式给出的 HTTP / SOCKS5 落地代理（粘贴链接的替代；非空时由此生成 Link）
+	Proxy *proxyInput `json:"proxy"`
+	// Upstream 出口代理（GOST 本机落地 / REALITY 节点可选）：客户端走入站协议加密，本机经该代理出站
+	Upstream   *upstreamInput `json:"upstream"`
+	ListenPort int            `json:"listenPort"`
+	UDP        *bool          `json:"udp"`
+	TargetHost string         `json:"targetHost"`
+	TargetPort int            `json:"targetPort"`
+	SNI        string         `json:"sni"`
+	Host       string         `json:"host"`
+	Enabled    *bool          `json:"enabled"`
 	// Mode 为 link（默认，粘贴落地机链接）/ gost（GOST 原生代理服务）。
 	Mode          string `json:"mode"`
 	GostLocal     bool   `json:"gostLocal"`
@@ -44,7 +49,12 @@ type nodeInput struct {
 	RealityPub     string `json:"realityPub"`
 	RealityShortId string `json:"realityShortId"`
 	RealitySni     string `json:"realitySni"`
-	Quota          *struct {
+	// RealityTransport：空/reality（默认）、ws-tls、ws（加速兼容模式）；RealityWsPath 留空自动生成；
+	// AccelHost 加速入口 host:port（nil 沿用旧值，空串清除）
+	RealityTransport string  `json:"realityTransport"`
+	RealityWsPath    string  `json:"realityWsPath"`
+	AccelHost        *string `json:"accelHost"`
+	Quota            *struct {
 		Enabled   bool   `json:"enabled"`
 		Period    string `json:"period"`
 		Bytes     int64  `json:"bytes"`
@@ -56,6 +66,54 @@ type nodeInput struct {
 		OutBps  int64 `json:"outBps"`
 	} `json:"rate"`
 	ConnLimit int `json:"connLimit"`
+	// ExpireAt 到期时间（Unix 秒）：未传沿用旧值，0 表示清除/永不到期。
+	ExpireAt *int64 `json:"expireAt"`
+}
+
+// proxyInput 结构化填写的落地代理。编辑时 Pass 留空表示沿用旧密码。
+type proxyInput struct {
+	Type string `json:"type"` // socks5 / http / https
+	Host string `json:"host"`
+	Port int    `json:"port"`
+	User string `json:"user"`
+	Pass string `json:"pass"`
+}
+
+// proxyLink 把结构化输入拼成标准代理链接；editing 为旧节点（可为 nil），用于密码留空时沿用。
+func proxyLink(p *proxyInput, old *model.Node) (string, error) {
+	scheme := strings.ToLower(strings.TrimSpace(p.Type))
+	switch scheme {
+	case "socks5", "http", "https":
+	case "socks", "socks5h":
+		scheme = "socks5"
+	default:
+		return "", fmt.Errorf("代理类型无效（支持 socks5 / http / https）")
+	}
+	host := strings.TrimSpace(p.Host)
+	if host == "" {
+		return "", fmt.Errorf("请填写落地代理的地址")
+	}
+	if net.ParseIP(host) == nil && !validHostname(host) {
+		return "", fmt.Errorf("落地地址无效: %s", host)
+	}
+	if p.Port <= 0 || p.Port > 65535 {
+		return "", fmt.Errorf("落地代理端口无效")
+	}
+	user, pass := strings.TrimSpace(p.User), p.Pass
+	if user != "" && pass == "" && old != nil && old.Mode == "link" {
+		// 编辑时密码留空：沿用旧链接里的密码（同一账号）。旧链接可能是 v2rayN 的
+		// base64(user:pass)@host 写法，原始 userinfo 不是明文，必须经 link.Parse 解码后再比对。
+		if info, err := link.Parse(old.LandingLink); err == nil {
+			if oldUser, oldPass := info.Credentials(); oldUser == user {
+				pass = oldPass
+			}
+		}
+	}
+	u := &url.URL{Scheme: scheme, Host: net.JoinHostPort(host, strconv.Itoa(p.Port))}
+	if user != "" {
+		u.User = url.UserPassword(user, pass)
+	}
+	return u.String(), nil
 }
 
 // nodeView 是返回给前端的节点信息。
@@ -189,11 +247,7 @@ func (s *Server) buildView(n *model.Node) *nodeView {
 // nodeClientURL 生成客户端实际连接本机监听端口的地址。
 func (s *Server) nodeClientURL(n *model.Node, host string) (string, *link.Info, error) {
 	if n.IsReality() {
-		cred := &singbox.RealityCred{
-			UUID: n.RealityUUID, PublicKey: n.RealityPub,
-			ShortID: n.RealityShortID, ServerName: n.RealitySNI,
-		}
-		return singbox.ClientURL(cred, n.ListenPort, host, n.Name), nil, nil
+		return singbox.NodeClientURL(n, host), nil, nil
 	}
 	if n.Mode == "gost" {
 		out, err := gostmgr.GostClientURL(n, host, n.ListenPort)
@@ -257,7 +311,7 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "保存失败: "+err.Error())
 		return
 	}
-	if err := s.ctl.ApplyNode(r.Context(), node); err != nil {
+	if err := s.ctl.ApplyNode(sysCtx(r), node); err != nil {
 		_ = s.ctl.RemoveNode(context.Background(), node)
 		_ = s.ctl.Store.DeleteNode(node.ID)
 		writeErr(w, http.StatusInternalServerError, "应用配置失败: "+err.Error())
@@ -266,6 +320,7 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.ctl.LoadNodes(); err != nil {
 		s.log.Warn("刷新节点缓存失败", "err", err)
 	}
+	s.ctl.SyncFirewall(sysCtx(r)) // 新节点进入缓存后再放行端口
 	if s.ctl.Alerts != nil {
 		go s.ctl.Alerts.NotifyNodeAdded(context.Background(), node)
 	}
@@ -301,7 +356,7 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.ctl.LoadNodes(); err != nil {
 		s.log.Warn("刷新节点缓存失败", "err", err)
 	}
-	if err := s.ctl.ApplyNode(r.Context(), node); err != nil {
+	if err := s.ctl.ApplyNode(sysCtx(r), node); err != nil {
 		// 回滚
 		s.log.Error("应用节点失败，已回滚", "node", id, "err", err)
 		if err := s.ctl.Store.SaveNode(old); err == nil {
@@ -326,6 +381,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.ctl.LoadNodes()
+	s.ctl.SyncFirewall(sysCtx(r)) // 节点移出缓存后收回端口
 	if s.ctl.Alerts != nil {
 		go s.ctl.Alerts.NotifyNodeDeleted(context.Background(), node)
 	}
@@ -345,6 +401,10 @@ func (s *Server) handleToggleNode(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
+	if req.Enabled && node.Expired() {
+		writeErr(w, http.StatusBadRequest, "节点已到期，请先编辑节点延长到期时间")
+		return
+	}
 	node.Enabled = req.Enabled
 	node.UpdatedAt = time.Now().Unix()
 	if err := s.ctl.Store.SaveNode(node); err != nil {
@@ -352,7 +412,7 @@ func (s *Server) handleToggleNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.ctl.LoadNodes()
-	if err := s.ctl.ApplyNode(r.Context(), node); err != nil {
+	if err := s.ctl.ApplyNode(sysCtx(r), node); err != nil {
 		writeErr(w, http.StatusInternalServerError, "应用配置失败: "+err.Error())
 		return
 	}
@@ -442,12 +502,31 @@ func (s *Server) handleNodeLink(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"url":     out,
+		"qrUrl":   s.nodeQRURL(node, host, out, info),
 		"host":    host,
 		"port":    node.ListenPort,
 		"landing": info,
-	})
+	}
+	if node.IsReality() && node.AccelHost != "" {
+		// 填了加速入口：url 指向入口；directUrl 为直连本机的链接（排障/备用）
+		resp["accelHost"] = node.AccelHost
+		resp["directUrl"] = singbox.ClientURL(singbox.CredOf(node), node.ListenPort, host, node.Name)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// nodeQRURL 返回二维码里编码的链接：http/socks 落地中转用手机客户端能识别的 v2rayN 写法，
+// 其它节点与客户端链接一致。
+func (s *Server) nodeQRURL(n *model.Node, host, clientURL string, info *link.Info) string {
+	if info == nil || n.Mode != "link" {
+		return clientURL
+	}
+	if u, err := info.MobileShareLink(host, n.ListenPort, n.Name, n.SNI, n.Host); err == nil {
+		return u
+	}
+	return clientURL
 }
 
 func (s *Server) handleParseLink(w http.ResponseWriter, r *http.Request) {
@@ -487,11 +566,12 @@ func (s *Server) handleQRCode(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "未配置中转机地址")
 		return
 	}
-	u, _, err := s.nodeClientURL(node, host)
+	u, info, err := s.nodeClientURL(node, host)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	u = s.nodeQRURL(node, host, u, info)
 	png, err := qrcode.Encode(u, qrcode.Medium, 320)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -569,8 +649,15 @@ func newNodeBase(old *model.Node) *model.Node {
 
 // buildLinkNode 处理“粘贴落地机链接”模式。
 func (s *Server) buildLinkNode(in *nodeInput, old *model.Node) (*model.Node, error) {
+	if in.Proxy != nil {
+		l, err := proxyLink(in.Proxy, old)
+		if err != nil {
+			return nil, err
+		}
+		in.Link = l
+	}
 	if strings.TrimSpace(in.Link) == "" {
-		return nil, fmt.Errorf("请填写落地机的 v2rayN 链接")
+		return nil, fmt.Errorf("请填写落地机链接，或填写 HTTP / SOCKS5 代理地址")
 	}
 	info, err := link.Parse(in.Link)
 	if err != nil {
@@ -715,6 +802,18 @@ func (s *Server) buildGostNode(in *nodeInput, old *model.Node) (*model.Node, err
 			return nil, fmt.Errorf("落地端口无效")
 		}
 	}
+	if n.GostLocal {
+		up, err := upstreamFrom(in.Upstream, old)
+		if err != nil {
+			return nil, err
+		}
+		n.Upstream = up
+		if n.HasUpstream() {
+			n.UDP = false // 出口代理只走 TCP
+		}
+	} else {
+		n.Upstream = nil
+	}
 	if err := gostmgr.ValidateGostNode(n); err != nil {
 		return nil, err
 	}
@@ -724,6 +823,48 @@ func (s *Server) buildGostNode(in *nodeInput, old *model.Node) (*model.Node, err
 	}
 	n.LandingLink = landing
 	return n, nil
+}
+
+// upstreamInput 出口代理（本机入站节点可选）。未传表示沿用旧值；地址留空表示清除；
+// 编辑时密码留空且账号未变则沿用旧密码。
+type upstreamInput struct {
+	Type string `json:"type"`
+	Host string `json:"host"`
+	Port int    `json:"port"`
+	User string `json:"user"`
+	Pass string `json:"pass"`
+}
+
+func upstreamFrom(in *upstreamInput, old *model.Node) (*model.Upstream, error) {
+	if in == nil {
+		if old != nil {
+			return old.Upstream, nil
+		}
+		return nil, nil
+	}
+	host := strings.TrimSpace(in.Host)
+	if host == "" {
+		return nil, nil
+	}
+	typ := strings.ToLower(strings.TrimSpace(in.Type))
+	switch typ {
+	case "", "socks5", "socks", "socks5h":
+		typ = "socks5"
+	case "http", "https":
+	default:
+		return nil, fmt.Errorf("出口代理类型无效（支持 socks5 / http / https）")
+	}
+	if net.ParseIP(host) == nil && !validHostname(host) {
+		return nil, fmt.Errorf("出口代理地址无效: %s", host)
+	}
+	if in.Port <= 0 || in.Port > 65535 {
+		return nil, fmt.Errorf("出口代理端口无效")
+	}
+	user, pass := strings.TrimSpace(in.User), in.Pass
+	if user != "" && pass == "" && old != nil && old.Upstream != nil && old.Upstream.User == user {
+		pass = old.Upstream.Pass
+	}
+	return &model.Upstream{Type: typ, Host: host, Port: in.Port, User: user, Pass: pass}, nil
 }
 
 // applyCommon 填充 link 与 gost 两种模式共用的字段：
@@ -806,6 +947,20 @@ func (s *Server) applyCommon(n *model.Node, in *nodeInput, old *model.Node, defa
 		n.Enabled = *in.Enabled
 	} else if old != nil {
 		n.Enabled = old.Enabled
+	}
+
+	// 到期时间：未传沿用旧值；新设置的时间必须晚于当前时刻
+	//（已到期节点仅改其它字段时允许保留原值，否则无法编辑已到期节点）
+	if in.ExpireAt != nil {
+		if *in.ExpireAt < 0 {
+			return fmt.Errorf("到期时间无效")
+		}
+		n.ExpireAt = *in.ExpireAt
+	} else if old != nil {
+		n.ExpireAt = old.ExpireAt
+	}
+	if n.ExpireAt > 0 && (old == nil || old.ExpireAt != n.ExpireAt) && n.ExpireAt <= time.Now().Unix() {
+		return fmt.Errorf("到期时间必须晚于当前时间")
 	}
 
 	// 配额计数起点：配额参数未变则沿用，否则从当前时刻重新计数
